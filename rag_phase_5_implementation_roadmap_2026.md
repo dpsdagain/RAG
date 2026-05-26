@@ -7,7 +7,7 @@ To ensure a smooth transition from a basic setup to an elite, agentic Thin-Clien
 ### Step 1: Core Foundation (MVP) - Priority: HIGH
 **Goal:** Establish the basic local-to-cloud pipeline and ensure end-to-end functionality without complex routing.
 *   **Action 1:** Set up the local Python native environment (`venv`), install `sqlite-vec`, and configure the document store with WAL mode.
-*   **Action 2:** Integrate `Cohere` API (`embed-english-v3.0`) for high-quality dense embeddings.
+*   **Action 2:** Integrate `bge-small-en-v1.5` via ONNX runtime for local CPU dense embeddings.
 *   **Action 3:** Connect to Cloud Ollama and set up a basic prompt for generative answering.
 *   **Action 4:** Build a basic CLI or Gradio UI to test the ingestion-retrieval-generation loop.
 
@@ -21,9 +21,9 @@ To ensure a smooth transition from a basic setup to an elite, agentic Thin-Clien
 ### Step 3: Linear Orchestration & True Memory - Priority: MEDIUM
 **Goal:** Introduce predictable linear routing and temporal episodic memory.
 *   **Action 1:** Implement Linear Pipeline (`Retrieve -> Rerank -> Evaluate Context -> Generate`).
-*   **Action 2:** Add single-retry self-correction logic (Context Evaluator node).
-*   **Action 3:** Implement CRAG-style Tavily Web Fallback for out-of-domain queries.
-*   **Action 4:** Implement Mem0-style episodic memory (`created_at`, `supersedes_id`) in SQLite.
+*   **Action 2:** Add simple single-retry query rewrite logic on failure.
+*   **Action 3:** Implement Graceful Degradation to Raw Evidence on API failure.
+*   **Action 4:** Implement Versioned User Preferences in SQLite.
 
 ### Step 4: Optimization & Benchmarking - Priority: LOW (but essential for scale)
 **Goal:** Finalize the system for daily driver usage, ensuring it stays within the 16GB RAM / 0 VRAM constraints.
@@ -39,22 +39,22 @@ To ensure a smooth transition from a basic setup to an elite, agentic Thin-Clien
 | :--- | :--- | :--- |
 | **Ingestion** | PyPDF / pymupdf4llm | pymupdf4llm + LlamaParse API |
 | **Chunking** | Fixed-size (e.g., 512 tokens + overlap) | Semantic Markdown splitting on LlamaParse/pymupdf4llm headers |
-| **Retrieval** | Single Dense Vector Search | Hybrid (BM25 + Dense) + CRAG Web Fallback |
+| **Retrieval** | Single Dense Vector Search | Dense-Only + Graceful Degradation |
 | **Reranking** | None (Raw DB scores) | FlashRank (Local CPU) |
 | **Orchestration** | Linear Script (Input -> VectorDB -> LLM) | Linear Pipeline + Single Self-Correction Retry |
-| **Memory** | None / Session history only | Mem0-style Episodic Memory |
+| **Memory** | None / Session history only | Versioned User Preferences |
 
 ### Which Features Matter Most?
 1.  **Good Ingestion:** If your raw data is parsed poorly, no LLM will rescue it.
 2.  **Reranking (FlashRank):** Reranking provides the highest ROI for retrieval accuracy. Retrieving 100 docs locally and reranking them down drastically reduces hallucination.
-3.  **High-Quality Embeddings:** Using an API embedder (Cohere) drastically improves initial retrieval over local models.
+3.  **High-Quality Local Embeddings:** Using a highly efficient local model (`bge-small-en-v1.5`) provides excellent retrieval without hitting API limits or introducing network latency.
 4.  **Evaluation Harness (Ragas):** Having a Golden Set to benchmark against prevents blind prompt tuning.
 
 ---
 
 ## 3. Common Mistakes & Pitfalls
 
-*   **Don't run *any* model on the GPU:** With a 0-VRAM baseline constraint, reranking must run strictly on the CPU, while heavy generation and embedding are offloaded to the cloud. Trying to shoehorn models onto the GPU will break the system.
+*   **Don't run *any* model on the GPU:** With a 0-VRAM baseline constraint, reranking and embedding must run strictly on the CPU, while heavy generation is offloaded to the cloud. Trying to shoehorn models onto the GPU will break the system.
 *   **Ignoring Table and Image Data:** Standard PDF parsers destroy tables. Ensure the ingestion pipeline falls back to LlamaParse when pymupdf4llm struggles.
 *   **"Blind" Retrieval:** Trusting the Vector DB's top 3 results without a Cross-Encoder Reranker usually results in sub-optimal context and hallucinations.
 *   **Multi-Agent Infinite Loops:** Complex cyclical agent graphs often lead to endless loops and massive API bills. Use a predictable linear pipeline with a strict single-retry limit instead.
@@ -79,7 +79,7 @@ To ensure the system is elite, you must evaluate it systematically using framewo
 *   **Retrieval Latency:** Time taken by `sqlite-vec` + FlashRank. Target: < 1000ms.
 
 ### D. Memory Quality Evaluation
-*   **State Retention Accuracy:** Evaluating if LangGraph accurately remembers user preferences across a 10-turn conversation.
+*   **State Retention Accuracy:** Evaluating if the async pipeline accurately remembers user preferences across a 10-turn conversation.
 
 ---
 
@@ -87,11 +87,10 @@ To ensure the system is elite, you must evaluate it systematically using framewo
 
 | Metric | Target Benchmark |
 | :--- | :--- |
-| **Embedder API Latency** | < 200ms |
+| **Local ONNX Embedding Latency** | < 50ms |
 | **Total Resident RAM Usage** | ~6.5-8.5 GB (sqlite-vec + orchestration + python) |
 | **Indexing Speed** | > 30-400 chunks/s batched |
 | **Retrieval Speed (Local DB)** | < 50ms per query (brute force on ~100k vectors) |
 | **Local FlashRank rerank (100 chunks)** | < 800ms |
-| **Reranking Latency (Cohere)** | < 300ms for 15 chunks (Optional upgrade) |
 | **Faithfulness Score** | > 0.95 (Ragas metric) |
 | **Context Recall** | > 0.90 (Ragas metric) |

@@ -15,7 +15,7 @@ rag-system/
 │   │   ├── routes/             # Endpoints (ingest, retrieve, admin)
 │   │   └── schemas.py          # Pydantic validation models
 │   ├── core/                   # Core business logic & orchestration
-│   │   ├── orchestration/      # LangGraph state machines & agent graphs
+│   │   ├── orchestration/      # Async pipeline state and routing logic
 │   │   ├── agents/             # Individual agent definitions (Planner, Critic)
 │   │   └── memory/             # Local preference engine
 │   ├── ingestion/              # Data ingestion & parsing pipeline
@@ -57,10 +57,12 @@ The entire storage layer relies on SQLite extended with `sqlite-vec`.
 *   `chunk_id` (UUID, Primary Key)
 *   `doc_id` (UUID, Foreign Key -> documents)
 *   `content` (Text, the raw chunk)
-*   `embedding` (F32_BLOB, sqlite-vec dimension=1024 for confirmed embedder: Cohere embed-english-v3.0)
-*   `bm25_tokens` (Text, tokenized representation for FTS5 keyword search)
+*   `embedding` (F32_BLOB, sqlite-vec dimension=384 for confirmed embedder: BAAI/bge-small-en-v1.5)
 *   `chunk_index` (Integer, sequential order in document)
 *   `parent_chunk_id` (UUID, Optional, Foreign Key -> chunks)
+
+**Table: `chunks_fts`** (Virtual FTS5 Table for BM25)
+*   `CREATE VIRTUAL TABLE chunks_fts USING fts5(content, content='chunks', content_rowid='rowid')`
 
 ### 2. State & Memory Store
 **Table: `working_memory`** (Linear Pipeline State)
@@ -79,15 +81,15 @@ The entire storage layer relies on SQLite extended with `sqlite-vec`.
 
 ## C. INGESTION WORKERS
 
-Ingestion runs via a **single in-process background worker** (using Python `threading` or `asyncio`). Idempotency is enforced by a file-hash check against the `documents` table. Failed parses are logged to a local `failed_ingests` SQLite table.
+Ingestion runs via a **multi-process background worker** (using Python `multiprocessing`). Idempotency is enforced by a file-hash check against the `documents` table. Failed parses are logged to a local `failed_ingests` SQLite table.
 
-**CPU Contention Rule:** Indexing is strictly throttled to N CPU threads and paused/niced while a query is in flight, so embedding a large PDF doesn't starve active query latency.
+**GIL & CPU Contention Rule:** Because heavy PDF parsing and chunking block the Global Interpreter Lock (GIL) and freeze the UI, ingestion is strictly isolated to a separate OS-level process. Indexing is throttled to N-2 cores. ONNX thread limits are explicitly set (`OMP_NUM_THREADS`, `sess_options.intra_op_num_threads`) to prevent runaway thread spawning during embeddings.
 
 ### Modality Specifications
 *   **PDF Ingestion:**
     *   *Parser:* Attempt **pymupdf4llm** local text extraction first. Route to the **LlamaParse API** *only* when local text-extraction coverage is below threshold (e.g., heavily scanned/complex).
-    *   *Chunking:* Semantic Markdown Splitter.
-    *   *Embedding:* Cohere `embed-english-v3.0` API (maximizes semantic recall vs local models).
+    *   *Chunking:* Strict Semantic Markdown Splitter. Boundaries are triggered on `#` or `##` headers. Maximum token size is 512 tokens before a hard split. Every chunk must inherit and track its `parent_chunk_id`.
+    *   *Embedding:* Local `bge-small-en-v1.5` via ONNX runtime.
 *   **Codebase Ingestion:**
     *   *Parser:* Local Tree-sitter AST extraction.
 
@@ -101,17 +103,14 @@ The pipeline is optimized for maximum semantic precision running on local CPU re
 1.  **Routing (Confidence-Based):** 
     *   If query is simple conversational -> Skip retrieval.
 2.  **Hybrid Retrieval (Stage 1):**
-    *   Dense Search (`sqlite-vec` via Cohere API) -> Top 50.
+    *   Dense Search (`sqlite-vec` via local bge-small) -> Top 50.
     *   Sparse Search (SQLite FTS5 BM25) -> Top 50.
     *   Merge via Reciprocal Rank Fusion (RRF) -> Top 100.
 3.  **Local Reranking (Stage 2):**
     *   Pass Top 100 to `FlashRank` (CPU bound, <200MB RAM).
     *   Prune to Top 15.
 4.  **Parent-Context Injection (Small-to-Big):**
-    *   For the Top 15 chunks, retrieve their associated `parent_chunk_id` content to inject broader surrounding context before final truncation.
-5.  **Final Reranking & Web Fallback (Stage 3):**
-    *   Pass Top 15 + Query to Cohere API (Cross-Encoder) for maximum precision, pruning to Top 5.
-    *   **CRAG Web Fallback:** If the top reranked chunks fail the empirically calibrated confidence threshold, silently fallback to the **Tavily Web Search API** to fetch external context.
+    *   For the Top 15 chunks, retrieve their associated `parent_chunk_id` content to inject broader surrounding context before final generation.
 
 ### Thresholds
 *   **Relevance Threshold:** Calibrated dynamically against a local Ragas evaluation Golden Set (no hardcoded cosine thresholds).
@@ -127,12 +126,11 @@ The pipeline is optimized for maximum semantic precision running on local CPU re
 
 ## F. ORCHESTRATION: LINEAR PIPELINE
 
-Replacing the complex multi-agent cyclical graph with a predictable **Linear Pipeline** (`Retrieve -> Rerank -> Evaluate Context -> Generate`).
+Replacing the complex multi-agent cyclical graph with a predictable **Linear Pipeline** (`Retrieve -> Rerank -> Generate`).
 
 ### Orchestration Logic & Safeguards
-*   **Self-Correction:** The context evaluator node assesses retrieved chunks. If they fail to answer the query, it triggers exactly **one** targeted query rewrite and retry.
-*   **Graceful Degradation:** If the retry fails, the pipeline gracefully degrades without infinite looping, returning a fallback response or basic web search results.
-*   **Fallback Handling:** The generation LLM and embedder are cloud dependencies. On API timeout: trigger one retry with exponential backoff. If it still fails, the pipeline degrades by returning the reranked chunks as raw evidence with an "API unavailable" notice.
+*   **Self-Correction:** On API failure or generation timeout, it triggers exactly **one** targeted query rewrite and retry.
+*   **Graceful Degradation:** If the retry fails, the pipeline gracefully degrades without infinite looping, returning the raw reranked chunks directly to the user as evidence.
 
 ---
 
@@ -147,7 +145,7 @@ FastAPI-based async REST architecture.
 ## H. QUEUE AND EVENT SYSTEM
 
 Because this is a single-user system designed for 0 VRAM and constrained RAM, external brokers (Redis/Celery/ARQ) are eliminated. 
-*   **Mechanics:** Uses a watched-folder `scripts/ingest.py` or a single `asyncio.Queue` worker running concurrently with the FastAPI app.
+*   **Mechanics:** Uses a watched-folder `scripts/ingest.py` running as a dedicated `multiprocessing` background service isolated from the FastAPI app.
 *   **Failure Recovery:** `failed_ingests` table tracks files requiring manual review.
 
 ---
@@ -195,4 +193,4 @@ Optimized for a native deployment on a 16GB RAM Windows/Linux machine. **Docker 
 ### Boot Script (`start.ps1`)
 1.  Verifies available RSS headroom is sufficient for launch.
 2.  Connects to SQLite and initializes `PRAGMA journal_mode=WAL;`.
-3.  Boots the FastAPI application and background ingestion threads natively on `localhost:8000`.
+3.  Boots the FastAPI application and background `multiprocessing` ingestion processes natively on `localhost:8000`.

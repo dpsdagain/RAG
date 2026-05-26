@@ -13,8 +13,8 @@ This repository hosts a complete 7-phase system design and engineering blueprint
 ## ✨ Key Features & Capabilities
 
 *   **Multi-Modal Ingestion:** Seamlessly parses complex PDFs (pymupdf4llm + LlamaParse for scanned/complex), codebases (with AST extraction), and websites.
-*   **Self-Correcting Agentic Loops:** Uses LangGraph to automatically critique and re-retrieve context if the first pass fails.
-*   **Long-Term Memory:** Maintains a user-editable preference memory with optional chronological decay.
+*   **Linear Pipeline & Self-Correction:** Uses a pure async Python pipeline to automatically critique and rewrite the query if the first retrieval pass fails.
+*   **Versioned User Preferences:** Maintains a version-controlled, user-editable preference store in SQLite.
 *   **Two-Stage Reranking:** Merges dense and sparse vectors locally, runs Local CPU FlashRank reranking, and allows an optional Cohere cross-encoder pass.
 *   **Graceful Degradation:** On generation-API failure, it retries and then surfaces the ranked source evidence back to the user, preventing a crash while avoiding dangerous micro-model hallucinations.
 
@@ -30,13 +30,13 @@ This system resolves those limitations by keeping **logic, routing, state, and v
 graph TD
     subgraph "Local Machine (16GB RAM / 0 VRAM)"
         UI["User Interface (CLI/Web)"]
-        Orchestrator["LangGraph Orchestrator (Python)"]
-        APIEmbed["Cohere API (embed-english-v3.0)"]
+        Orchestrator["Linear Pipeline (Async Python)"]
+        LocalEmbed["BAAI/bge-small-en-v1.5 (CPU)"]
         
         subgraph "Local Storage Layer"
             VecDB["sqlite-vec (Vector DB)"]
             DocStore["SQLite (Raw Docs)"]
-            StateDB["SQLite Checkpointer (Agent State)"]
+            StateDB["SQLite (Pipeline Checkpointer)"]
         end
     end
 
@@ -60,15 +60,24 @@ graph TD
 
 ---
 
+## ⚖️ Why Local RAG in the 2M Token Era?
+
+With frontier models like Claude 3.5 and Gemini 1.5 boasting 1M-2M token context windows, why build a complex RAG system at all?
+1. **Time To First Token (TTFT):** Stuffing a 500k-token database into an API call takes 15-20+ seconds to start generating a response. This architecture targets **sub-2-second TTFT**.
+2. **Near-Zero Cost:** Sending massive contexts costs dollars per query. This local-first vector architecture drops per-query costs to near **zero**.
+3. **Data Ownership:** You maintain 100% local ownership of your documents and vector database on your SSD.
+
+---
+
 ## 📂 Repository Contents
 
 The design of the system is divided into 7 sequential phases:
 
 | Phase / File | Title | Description |
 | :--- | :--- | :--- |
-| **Phase 1** | [State of the Art (2026)](./rag_state_of_the_art_2026.md) | Deep-dive research into 2026 RAG frontiers (Subquadratic architectures, late chunking, sparse/dense hybrid, CoALA agent memory). |
+| **Phase 1** | [State of the Art (2026)](./rag_state_of_the_art_2026.md) | Deep-dive research into 2026 RAG frontiers (Subquadratic architectures, late chunking, sparse/dense hybrid, versioned preference memory). |
 | **Phase 2** | [Initial Architecture](./rag_architecture_2026.md) | Draft layout of the ideal architecture, memory layouts, database considerations, and parsing techniques. |
-| **Phase 3** | [Technology Stack](./rag_tech_stack_2026.md) | Definitive tech stack blueprint tailored precisely for 16GB RAM / 0 VRAM limits (Cohere API, `sqlite-vec`, Linear Pipeline). |
+| **Phase 3** | [Technology Stack](./rag_tech_stack_2026.md) | Definitive tech stack blueprint tailored precisely for 16GB RAM / 0 VRAM limits (bge-small-en-v1.5 CPU, `sqlite-vec`, Pure Async Python). |
 | **Phase 4** | [Final Architecture Maps](./rag_final_architecture_2026.md) | Detailed Mermaid blueprints covering system design, sequence data flow, memory hierarchies, ingestion pipelines, and agent communication. |
 | **Phase 5** | [Implementation Roadmap](./rag_phase_5_implementation_roadmap_2026.md) | Step-by-step rollout plan (MVP to production-grade) highlighting critical evaluation metrics, latencies, and performance benchmarks. |
 | **Phase 6** | [Architectural Self-Critique](./rag_phase_6_self_critique_2026.md) | Hard-nosed critique of potential bottlenecks, API dependencies, and complexity traps, presenting the **V2 Elite Pivot** optimizations. |
@@ -81,22 +90,22 @@ The design of the system is divided into 7 sequential phases:
 The **V2 Architecture** (detailed in Phase 6 & Phase 7) resolves standard RAG failure points with:
 1. **Two-Stage Reranking:** Rather than sending 100 chunks over the network to a cloud cross-encoder (which incurs massive API inference costs and latency), the system leverages a local CPU-bound `FlashRank` pass to trim down to 15 chunks before (optionally) calling the cloud reranker.
 2. **Graceful Degradation:** The generation LLM is the only mandatory cloud call. If it times out or drops connection, the orchestrator routes the retrieved and ranked evidence directly back to the user instead of crashing.
-3. **Confidence-Based Routing:** Simple conversational queries or highly-confident search matches bypass expensive multi-agent LangGraph cycles to save API costs and speed up CPU response times.
+3. **Confidence-Based Routing:** Simple conversational queries bypass complex retrieval and fallback routines to save API costs and speed up CPU response times.
 4. **Decoupled Asynchronous Ingestion:** An independent in-process background worker handles heavy PDF ingestion without blocking the main UI thread, pausing when active queries need CPU resources.
 
 ---
 
 ## ⚡ Technical Stack Summary
 
-*   **Orchestrator:** LangGraph (cyclical, state-managed)
+*   **Orchestrator:** Pure Native Async Python (linear, single-retry fallback)
 *   **Vector Database:** `sqlite-vec` (extremely lightweight, C-extension for SQLite)
 *   **Keyword Search:** SQLite FTS5 (BM25)
-*   **Embeddings:** `Cohere API` (embed-english-v3.0, high semantic quality)
+*   **Embeddings:** `BAAI/bge-small-en-v1.5` (Local CPU, fast and lightweight)
 *   **Parser:** pymupdf4llm (Local Markdown-aware Text) / LlamaParse API (Cloud VLM for complex markdown/tables)
 *   **Reranker:** `FlashRank` (Local CPU Stage 1) + Cohere Rerank API (Cloud Stage 2, Optional)
 *   **Primary LLM:** Ollama Cloud (Cloud)
-*   **Agent State:** SQLite Checkpointer
-*   **Long-Term Memory:** SQLite KV (Versioned preferences)
+*   **Pipeline State:** SQLite Checkpointer
+*   **Long-Term Memory:** SQLite KV (Versioned User Preferences)
 
 ---
 

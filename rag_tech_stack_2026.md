@@ -29,8 +29,8 @@
 - **LlamaIndex:** The king of Data Ingestion and Indexing. 
 - **Haystack:** Great for highly structured, linear NLP pipelines.
 - **DSPy:** Compiles and optimizes prompts based on evaluation metrics.
-- **LangGraph:** The industry standard for Agentic Orchestration. Its cyclic graph structure and PostgresSaver state management make it the only logical choice for complex multi-agent RAG.
-- **Verdict:** Use **LlamaIndex** for data, **LangGraph** for orchestration, and **DSPy** to optimize prompts.
+- **Pure Async Python:** A simple, brutally efficient native Python pipeline (linear flow with a single retry loop) completely replaces complex cyclical graph frameworks.
+- **Verdict:** Use **LlamaIndex** for data, **Pure Async Python** for orchestration, and **DSPy** to optimize prompts.
 
 ---
 
@@ -38,7 +38,7 @@
 
 ### 1. BEST OVERALL STACK (The "Power-User Hybrid")
 *Requires strong local hardware (e.g., 24GB VRAM).*
-- **Orchestrator:** LangGraph
+- **Orchestrator:** Native Python Pipeline
 - **Data/Ingestion:** Docling & LlamaIndex
 - **Vector DB:** Qdrant (Local Docker)
 - **Local Engine & Model:** SGLang running ZAYA1-8B (MoE)
@@ -46,7 +46,7 @@
 
 ### 2. BEST LOCAL-FIRST STACK
 *Zero cloud dependency. Requires high-end Apple Silicon or 24GB+ VRAM GPU.*
-- **Orchestrator:** LangGraph
+- **Orchestrator:** Native Python Pipeline
 - **Database:** LanceDB
 - **Local Engine & Model:** Ollama running Qwen3
 - **Vision/Multimodal:** ColQwen2.5 (Late-interaction visual retrieval)
@@ -65,7 +65,7 @@
 
 ### 5. BEST HYBRID (SERVERLESS) STACK
 *Maximum performance, zero local infrastructure management.*
-- **Orchestrator:** LangGraph Cloud
+- **Orchestrator:** Managed Orchestrators
 - **Vector DB:** Pinecone Serverless
 - **Models:** GPT-5.5 Instant + Gemini 3.5 Flash
 
@@ -84,11 +84,11 @@ Your local machine manages the logic, state, and lightweight database, while hea
 
 | Component | Selection | Where it runs | Why it works for you |
 |---|---|---|---|
-| **Orchestrator** | **LangGraph** | **Local** | It's just Python code. It uses virtually zero RAM/VRAM and gives you total control over the agent logic locally. |
+| **Orchestrator** | **Pure Native Async Python** | **Local** | A simple linear async script with error handling and fallback logic. No cyclic agents, zero framework overhead. |
 | **Database** | **sqlite-vec** | **Local** | Runs as a single file on your SSD. It sips your 16GB of system RAM without needing a heavy background server like Docker. |
-| **Embeddings** | **Cohere embed-english-v3.0 (1024-dim)** | **Cloud API** | Massive recall upgrade over local models; offloads CPU constraint. |
+| **Embeddings** | **BAAI/bge-small-en-v1.5 (384-dim)** | **Local CPU** | Small enough to run on CPU at ~5-20 ms/query and embed your corpus in minutes; VRAM not used. |
 | **Primary LLM** | **Ollama Cloud** | **Cloud** | Offloads 100% of the VRAM-heavy reasoning and generation to the cloud, preventing your machine from freezing. |
-| **Reranker** | **FlashRank (Local CPU, default) + Cohere optional** | **Local/Cloud** | FlashRank handles 100->15 reranking on CPU instantly. Cohere provides an optional cross-encoder precision upgrade. |
+| **Reranker** | **FlashRank (Local CPU)** | **Local** | Handles 100->15 reranking on CPU instantly. Dense-only MVP relies strictly on this stage. |
 | **Parsing** | **pymupdf4llm local (text PDFs) / LlamaParse cloud (scanned/complex)** | **Local+Cloud** | Local pymupdf4llm (Markdown-aware) saves cloud costs and preserves headers for chunking. Offloading complex visual PDFs ensures you get clean text back instantly without crashing local memory. |
 
 ### Carried forward vs. dropped from the ideal phases
@@ -101,9 +101,9 @@ To ensure this build is strictly feasible on the 0-VRAM constraint, several theo
 
 ### The Data Flow Architecture:
 1. **User Input:** You ask a complex question on your local machine.
-2. **Orchestration (Local):** LangGraph (running locally) receives the query.
-3. **Embedding (API):** The query is converted to a vector using the Cohere API for high semantic precision.
-4. **Retrieval (Local):** `sqlite-vec` quickly scans your local hard drive for the top 100 matches.
+2. **Orchestration (Local):** The native Async Python pipeline receives the query.
+3. **Embedding (Local):** The query is converted to a vector using the tiny local bge-small-en-v1.5 CPU model.
+4. **Retrieval (Local):** Dense-only retrieval via `sqlite-vec` quickly scans your local hard drive for the top 100 matches (FTS5/BM25 is a later-phase addition).
 5. **Reranking (Local):** FlashRank reranks those 100 chunks down to the top 15 on CPU.
-6. **Synthesis (Cloud):** LangGraph sends your prompt + the top chunks to Ollama Cloud.
+6. **Synthesis (Cloud):** The pipeline sends your prompt + the top chunks to Ollama Cloud.
 7. **Response (Local):** Ollama Cloud streams the final answer back to your local UI.

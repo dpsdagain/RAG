@@ -2,7 +2,7 @@
 
 ## 1. Deconstructing the "Thin-Client" Architecture
 
-The architecture defined in Phases 3 and 4 relies heavily on a "Thin-Client" paradigm: Orchestration (LangGraph), Vector DB (`sqlite-vec`), and Embeddings (`MiniLM-L6`) are local, while Generation (Ollama) is offloaded to the cloud due to the strict 16GB RAM / 0 VRAM hardware constraint.
+The architecture defined in Phases 3 and 4 relies heavily on a "Thin-Client" paradigm: Orchestration (Async Python Pipeline), Vector DB (`sqlite-vec`), and Embeddings (`bge-small`) are local, while Generation (Ollama) is offloaded to the cloud due to the strict 16GB RAM / 0 VRAM hardware constraint.
 
 While theoretically sound for hardware bypass, a rigorous evaluation reveals critical engineering flaws, CPU bottlenecks, and maintenance traps.
 
@@ -17,14 +17,14 @@ While theoretically sound for hardware bypass, a rigorous evaluation reveals cri
 
 ### B. API Fragility
 **The Flaw:** The architecture's uptime relies heavily on the Generation LLM cloud provider (e.g., Ollama Cloud).
-- **Failure Point:** If the LLM provider times out or rate-limits you, the entire LangGraph orchestration cycle crashes, leaving the user with a hung terminal.
+- **Failure Point:** If the LLM provider times out or rate-limits you, the entire pipeline crashes, leaving the user with a hung terminal.
 
-### C. Complexity Traps in LangGraph
-**The Flaw:** Using LangGraph with multi-agent cyclical graphs (Supervisor, Research Agent, Critic) introduces a catastrophic complexity trap for a single-user system.
+### C. Complexity Traps in Multi-Agent Frameworks
+**The Flaw:** Using multi-agent cyclical graphs (Supervisor, Research Agent, Critic) introduces a catastrophic complexity trap for a single-user system.
 - **The Trap:** If the "Critic" node evaluates the "Research" context and finds it lacking, it sends the graph back to Research. If the documents simply *don't exist* in `sqlite-vec`, the system enters an infinite API loop, burning cloud tokens until the max recursion limit is hit. 
 
 ### D. Concurrency & `database is locked`
-**The Flaw:** We rely on SQLite for the main document store, vector store, and LangGraph checkpointer.
+**The Flaw:** We rely on SQLite for the main document store, vector store, and pipeline checkpointer.
 - While SQLite handles reads brilliantly, concurrent writes are bottlenecked by locks. If a background ingestion thread updates documents while the main thread caches a new chunk, the system will throw `database is locked` exceptions.
 
 ### E. Memory Drift
@@ -34,8 +34,8 @@ While theoretically sound for hardware bypass, a rigorous evaluation reveals cri
 
 ## 3. Scaling Risks & Future-Proofing
 
-*   **Context Window Obsolescence:** In late-2026, API models handle 2M+ tokens natively. The risk here is over-engineering a highly complex retrieval and reranking pipeline when it might soon be cheaper to simply pass a massive chunk of the SQLite database directly into a cloud LLM.
-*   **CPU Contention:** Because this is a 0-VRAM architecture, everything except Generation runs on your CPU. If you drop a massive 500-page PDF into the ingestion folder, it used to consume all cores. Now, the Cohere API will handle embeddings, keeping your local CPU completely free for FlashRank and ingestion routing.
+*   **Context Window Obsolescence:** In late-2026, API models handle 1M-2M+ tokens natively. Why build RAG? Because stuffing a massive 500k-token SQLite database into an API call takes 15-20+ seconds for Time To First Token (TTFT) and costs dollars per query. This architecture guarantees sub-2-second TTFT, near-zero per-query API costs, and total local data ownership.
+*   **CPU Contention:** Because this is a 0-VRAM architecture, everything except Generation runs on your CPU. If you drop a massive 500-page PDF into the ingestion folder, the local `bge-small` embedding pass will consume CPU cycles, requiring careful core management.
 
 ---
 ---
@@ -54,17 +54,17 @@ To mitigate these flaws, we must optimize API inference, simplify state manageme
 
 ### Improvement 2: Graceful Degradation (Raw Evidence Fallback)
 *   **The Fix:** API failures must not crash the local UX, but running a 1.5B LLM fallback on CPU is too slow and hallucination-prone.
-*   **The Implementation:** If the generation API times out, we trigger one retry with backoff. If it still fails, LangGraph traps the error and **surfaces the Top-5 reranked chunks directly to the user as raw evidence**, with a "generation unavailable" notice. This preserves 100% uptime without relying on a dangerous micro-model.
+*   **The Implementation:** If the generation API times out, we trigger one retry with backoff. If it still fails, the pipeline traps the error and **surfaces the Top-5 reranked chunks directly to the user as raw evidence**, with a "generation unavailable" notice. This preserves 100% uptime without relying on a dangerous micro-model.
 
-### Improvement 3: Confidence-Based Graph Routing (Complexity Reduction)
-*   **The Fix:** Stop using the multi-agent loop for every query.
-*   **The Implementation:** Add a fast heuristic at the start of LangGraph. If the cosine similarity of the Top 1 chunk from `sqlite-vec` is `> 0.85`, bypass the entire multi-agent cycle and route straight to final synthesis. This dramatically saves CPU cycles and API costs.
+### Improvement 3: Predictable Linear Routing (Complexity Reduction)
+*   **The Fix:** Stop using dynamic confidence routers and multi-agent loops. Cosine similarity measures lexical overlap, not factual confidence.
+*   **The Implementation:** Unconditionally route every query through the linear retrieval pipeline and into FlashRank. Do not use hardcoded cosine thresholds to skip reranking.
 
-### Improvement 4: Event-Driven Memory Garbage Collection & WAL
-*   **The Fix:** Prevent SQLite write-locks and memory drift.
+### Improvement 4: Deterministic Preference Deduplication & WAL
+*   **The Fix:** Prevent SQLite write-locks and eliminate unsupervised LLM memory corruption.
 *   **The Implementation:** 
     1. The SQLite database is strictly initialized with `PRAGMA journal_mode=WAL;` to allow concurrent reads and writes.
-    2. Implement an offline Cron agent that runs when the system is idle. It uses the Cloud LLM to merge and prune outdated preference rules, keeping long-term memory perfectly consolidated.
+    2. Preferences are managed via a deterministic, append-only versioned schema. When a user updates a preference, the old row is marked `superseded`, bypassing the need for a dangerous, hallucination-prone offline LLM cron job.
 
 ### Improvement 5: In-Process CPU Contention Management
 *   **The Fix:** Do not let background indexing starve foreground query latency.

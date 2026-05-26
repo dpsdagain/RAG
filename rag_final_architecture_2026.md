@@ -13,20 +13,19 @@
 graph TD
     subgraph "Local Machine (16GB RAM / 0 VRAM)"
         UI["User Interface (CLI/Web)"]
-        Orchestrator["LangGraph Orchestrator (Python)"]
-        APIEmbed["Cohere API (embed-english-v3.0)"]
+        Orchestrator["Linear Pipeline (Async Python)"]
+        LocalEmbed["BAAI/bge-small-en-v1.5 (CPU)"]
         
         subgraph "Local Storage Layer"
             VecDB["sqlite-vec (Vector DB)"]
             DocStore["SQLite (Raw Docs)"]
-            StateDB["SQLite Checkpointer (Agent State)"]
+            StateDB["SQLite (Pipeline Checkpointer)"]
         end
     end
 
     subgraph "Cloud Compute & APIs"
         Ollama["Ollama Cloud (LLM Reasoning & Generation)"]
         LlamaParse["LlamaParse API (VLM Parsing)"]
-        Cohere["Cohere API (Cross-Encoder Reranking)"]
     end
 
     UI <--> Orchestrator
@@ -38,13 +37,12 @@ graph TD
 
     Orchestrator <--> Ollama
     Orchestrator <--> LlamaParse
-    Orchestrator -.->|Optional Upgrade| Cohere
     
     classDef local fill:#2a4365,stroke:#90cdf4,stroke-width:2px,color:#e2e8f0
     classDef cloud fill:#742a2a,stroke:#feb2b2,stroke-width:2px,color:#e2e8f0
     
     class UI,Orchestrator,LocalEmbed,VecDB,DocStore,StateDB local
-    class Ollama,LlamaParse,Cohere cloud
+    class Ollama,LlamaParse cloud
 ```
 
 ---
@@ -55,38 +53,28 @@ graph TD
 ```mermaid
 sequenceDiagram
     participant User
-    participant LangGraph as LangGraph Orchestrator
-    participant Embed as Cohere API
+    participant Pipeline as Async Pipeline
+    participant Embed as bge-small (Local CPU)
     participant VecDB as sqlite-vec (Local)
     participant FlashRank as FlashRank (Local CPU)
-    participant Cohere as Cohere Rerank (Cloud, Optional)
     participant Ollama as Ollama Cloud (LLM)
 
-    User->>LangGraph: "What are the core features of project X?"
-    LangGraph->>Ollama: [Query Routing/Rewrite Task]
-    Ollama-->>LangGraph: Returns Optimized Queries
+    User->>Pipeline: "What are the core features of project X?"
+    Pipeline->>Ollama: [Query Rewrite Task]
+    Ollama-->>Pipeline: Returns Optimized Queries
     
-    LangGraph->>Embed: Send Optimized Queries
-    Embed-->>LangGraph: Returns Dense Vectors
+    Pipeline->>Embed: Send Optimized Queries
+    Embed-->>Pipeline: Returns Dense Vectors
     
-    LangGraph->>VecDB: Retrieve top-K=100 chunks
-    VecDB-->>LangGraph: Returns 100 Raw Chunks
+    Pipeline->>VecDB: Retrieve top-K=100 chunks
+    VecDB-->>Pipeline: Returns 100 Raw Chunks
     
-    LangGraph->>FlashRank: Rerank Top 100
-    FlashRank-->>LangGraph: Returns Top-K=15 Chunks
+    Pipeline->>FlashRank: Rerank Top 100
+    FlashRank-->>Pipeline: Returns Top-K=15 Context Chunks
     
-    opt If Cohere is DISABLED
-        LangGraph->>LangGraph: Truncate to Top-K=5 Chunks
-    end
-    
-    opt High Precision Cloud Upgrade (Cohere ENABLED)
-        LangGraph-->>Cohere: Send 15 Chunks + Query for Reranking
-        Cohere-->>LangGraph: Returns Top-K=5 Reranked Chunks
-    end
-    
-    LangGraph->>Ollama: Generate response using Top-K=5 Context
-    Ollama-->>LangGraph: Streams Final Synthesis
-    LangGraph->>User: Streams Final Answer
+    Pipeline->>Ollama: Generate response using Top-K=15 Context
+    Ollama-->>Pipeline: Streams Final Synthesis
+    Pipeline->>User: Streams Final Answer
 ```
 
 ---
@@ -97,9 +85,9 @@ sequenceDiagram
 ```mermaid
 graph BT
     L1["L1: Model Memory<br>(Parametric weights in Cloud LLM)"] 
-    L2["L2: Working Memory<br>(LangGraph Context Window & State)"]
+    L2["L2: Working Memory<br>(Pipeline Context Window & State)"]
     L3["L3: Semantic System Memory<br>(sqlite-vec chunks & documents)"]
-    L4["L4: Procedural / Episodic Memory<br>(Versioned preference store - SQLite KV, user-editable)"]
+    L4["L4: User Preferences<br>(Versioned store - SQLite KV, user-editable)"]
 
     L4 -->|Injects rules/history| L2
     L3 -->|Injects retrieved facts| L2
@@ -116,49 +104,33 @@ graph BT
 
 ```mermaid
 graph TD
-    Query["User Query"] --> Router{"Confidence Router"}
+    Query["User Query"] --> Embed["bge-small-en-v1.5<br>(Local CPU Embedding)"]
     
-    Router -->|High Confidence| DirectSearch["Standard Search"]
-    Router -->|Low Confidence| Decomp["Query Decomposition"]
+    Embed --> VecDB["sqlite-vec<br>(Dense Vector Search)"]
     
-    Decomp --> SubQ1["Sub-Query 1"]
-    Decomp --> SubQ2["Sub-Query 2"]
+    VecDB --> FlashRank["FlashRank<br>(Local CPU Reranking)"]
     
-    DirectSearch --> Hybrid["Hybrid Retrieval<br>(BM25 + Dense)"]
-    SubQ1 --> Hybrid
-    SubQ2 --> Hybrid
-    
-    Hybrid --> RRF["Reciprocal Rank Fusion (RRF)<br>Merge Results"]
-    RRF --> FlashRankRerank["FlashRank<br>(Local CPU)"]
-    FlashRankRerank --> Evaluator{"Context Evaluator<br>Passes?"}
-    
-    Evaluator -->|Yes| Final["Final Context Payload"]
-    Evaluator -->|No| Fallback["Trigger Rewrite/CRAG"]
+    FlashRank --> Final["Final Context Payload"]
 ```
 
 ---
 
 ### 5. Linear Pipeline Orchestration
-*The predictable linear pipeline replacing the cyclical multi-agent graph.*
+*The brutalist linear pipeline replacing the cyclical multi-agent framework.*
 
 ```mermaid
 graph TD
-    Start["User Query"] --> Retrieve["Hybrid Retrieval Phase"]
+    Start["User Query"] --> Embed["Local Embedding<br>(bge-small)"]
+    Embed --> Retrieve["Dense Retrieval Phase<br>(sqlite-vec)"]
     
     Retrieve --> Rerank["FlashRank Reranking"]
     
-    Rerank --> Evaluate{"Context Evaluator Node"}
+    Rerank --> Generate["Final Generation (Ollama)"]
     
-    Evaluate -->|Context is Good| Generate["Final Generation (Ollama)"]
-    
-    Evaluate -->|Context Poor| Rewrite["Targeted Query Rewrite<br>(Max 1 Retry)"]
-    Rewrite --> Retrieve
-    
-    Evaluate -->|Context Poor (After Retry)| Fallback["CRAG Web Fallback<br>(Tavily)"]
-    Fallback --> Generate
+    Generate -->|API Failure / Timeout| Fallback["Graceful Degradation<br>(Surface Raw Evidence to User)"]
     
     classDef pipe fill:#44337a,stroke:#b794f4,color:#faf5ff
-    class Retrieve,Rerank,Evaluate,Rewrite,Fallback pipe
+    class Embed,Retrieve,Rerank,Generate,Fallback pipe
 ```
 
 ---
@@ -206,11 +178,11 @@ graph TD
     
     SemanticChunking --> ChunkText["Context-Aware Chunks"]
     
-    ChunkText --> CohereEmbed["Cohere Embedding API<br>(embed-english-v3.0)"]
+    ChunkText --> BgeEmbed["bge-small-en-v1.5<br>(Local CPU Embedding)"]
     
-    CohereEmbed -->|Dense Vectors| VecDB[("sqlite-vec")]
+    BgeEmbed -->|Dense Vectors| VecDB[("sqlite-vec")]
     ChunkText -->|Raw Text| SQL[("Document Store")]
     
     classDef pipe fill:#1a202c,stroke:#a0aec0,color:#f7fafc
-    class Input,Cleaner,SemanticChunking,ChunkText,CohereEmbed pipe
+    class Input,Cleaner,SemanticChunking,ChunkText,BgeEmbed pipe
 ```
