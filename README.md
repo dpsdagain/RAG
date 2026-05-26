@@ -1,8 +1,22 @@
 # Thin-Client Agentic RAG System (2026)
 
+![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue)
+![Status: Specification](https://img.shields.io/badge/Status-Specification%20Phase-orange)
+![License: MIT](https://img.shields.io/badge/License-MIT-green)
+
 Welcome to the definitive architecture and implementation roadmap for an elite, high-performance **Agentic RAG System** designed for late-2026 deployment. 
 
 This repository hosts a complete 7-phase system design and engineering blueprint optimized for constrained local hardware (**16 GB RAM / 2 GB VRAM / CPU-first architecture**) using the **Thin-Client Orchestration Pattern**.
+
+---
+
+## ✨ Key Features & Capabilities
+
+*   **Multi-Modal Ingestion:** Seamlessly parses complex PDFs (with tables), codebases (with AST extraction), and websites.
+*   **Self-Correcting Agentic Loops:** Uses LangGraph to automatically critique and re-retrieve context if the first pass fails.
+*   **Long-Term Graph Memory:** Remembers your preferences and past conversations using Graphiti knowledge graphs, complete with automated temporal decay for outdated rules.
+*   **Two-Stage Reranking:** Merges dense and sparse vectors locally, reranks using CPU-bound `FlashRank`, and finalizes precision with Cohere Cross-Encoders.
+*   **Graceful Degradation:** Achieves 100% uptime. If cloud APIs fail, it automatically falls back to a 1.5B quantized micro-model running locally in your system RAM.
 
 ---
 
@@ -83,6 +97,16 @@ The **V2 Architecture** (detailed in Phase 6 & Phase 7) resolves standard RAG fa
 *   **Primary LLM:** Ollama Cloud (Cloud) / Quantized local models on CPU (Fallback)
 *   **Agent State:** `PostgresSaver` / SQLite Checkpointer
 *   **Long-Term Memory:** Graphiti (Temporal Knowledge Graphs)
+
+---
+
+## 📋 Prerequisites
+
+Before implementing the specification, ensure your local environment meets the following baseline requirements:
+*   **Hardware:** 16 GB RAM, 2 GB VRAM, 500 GB SSD.
+*   **Software:** Python 3.11+, Docker Desktop, Git.
+*   **Local Services:** Ollama installed locally.
+*   **API Keys Required:** Cohere API (Reranking), LlamaParse (VLM Ingestion).
 
 ---
 
