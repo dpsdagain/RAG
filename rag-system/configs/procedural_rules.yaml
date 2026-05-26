@@ -1,0 +1,136 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# RAG System – Procedural Rules
+#
+# Each rule is evaluated at query-planning time.  When the query matches a
+# rule's `condition`, the corresponding `action` fields are injected into the
+# pipeline to modify retrieval, prompting, or post-processing behaviour.
+#
+# Fields
+# ------
+# rule_id        Unique identifier (slug).
+# name           Human-readable name shown in logs / debug UI.
+# description    Longer explanation of intent.
+# priority       Lower number = higher priority.  Rules are evaluated in order.
+# is_active      false → rule is ignored at runtime.
+# condition      Matching criteria.  `query_pattern` is a regex applied to the
+#                user query; `source_types` restricts the rule to specific
+#                document types if present.
+# action         What the pipeline does when the rule fires.
+#   system_prompt_addon   Extra text appended to the system prompt.
+#   retrieval_boost       Multiplicative boost applied to matching source types.
+#   temperature_override  Overrides the default LLM temperature.
+#   max_tokens_override   Overrides the default max-tokens budget.
+#   require_citations     Forces citation extraction even if globally disabled.
+# ──────────────────────────────────────────────────────────────────────────────
+
+rules:
+  # ── 1. Code-related queries ──
+  - rule_id: "code_query"
+    name: "Code Query Handler"
+    description: >
+      Activates when the user asks about code, programming, implementation
+      details, APIs, functions, or debugging.  Boosts code-source chunks,
+      lowers temperature for deterministic answers, and asks the model to
+      include code snippets in its response.
+    priority: 10
+    is_active: true
+    condition:
+      query_pattern: "(?i)\\b(code|function|class|method|implement|debug|error|traceback|api|endpoint|syntax|refactor|bug|stack\\s?trace|import|module|library)\\b"
+      source_types:
+        - "code"
+        - "markdown"
+    action:
+      system_prompt_addon: >
+        The user is asking about source code.  When answering:
+        1. Include relevant code snippets wrapped in fenced code blocks.
+        2. Reference the file path and function/class name when available.
+        3. Explain the logic step-by-step if the question is about behaviour.
+        4. If suggesting changes, show a before/after diff.
+      retrieval_boost:
+        code: 2.0
+        markdown: 1.3
+      temperature_override: 0.05
+      require_citations: true
+
+  # ── 2. Explanation / conceptual queries ──
+  - rule_id: "explanation_query"
+    name: "Explanation Query Handler"
+    description: >
+      Fires on conceptual or "how/why does X work" questions.  Slightly
+      raises temperature for more natural prose and instructs the model to
+      use analogies and examples.
+    priority: 20
+    is_active: true
+    condition:
+      query_pattern: "(?i)\\b(explain|what\\s+is|how\\s+does|why\\s+does|describe|concept|overview|introduction|meaning|definition|understand)\\b"
+    action:
+      system_prompt_addon: >
+        The user wants an explanation.  Structure your answer as follows:
+        1. Start with a concise one-sentence definition.
+        2. Elaborate with supporting detail from the retrieved context.
+        3. Use analogies or concrete examples where helpful.
+        4. End with a brief summary or key takeaway.
+      temperature_override: 0.25
+      require_citations: true
+
+  # ── 3. Comparison queries ──
+  - rule_id: "comparison_query"
+    name: "Comparison Query Handler"
+    description: >
+      Activates on "compare", "difference", "vs", "pros and cons" phrasing.
+      Instructs the model to produce a structured side-by-side comparison and
+      requests a higher token budget to accommodate tabular output.
+    priority: 15
+    is_active: true
+    condition:
+      query_pattern: "(?i)\\b(compare|comparison|versus|\\bvs\\b|differ|difference|pros\\s+and\\s+cons|trade-?off|advantage|disadvantage)\\b"
+    action:
+      system_prompt_addon: >
+        The user wants a comparison.  Present your answer as:
+        1. A brief introduction naming the items being compared.
+        2. A markdown table with key dimensions as rows.
+        3. A concluding recommendation or summary of trade-offs.
+      max_tokens_override: 3072
+      temperature_override: 0.15
+      require_citations: true
+
+  # ── 4. Summarisation queries ──
+  - rule_id: "summary_query"
+    name: "Summary Query Handler"
+    description: >
+      Triggers on summarisation requests.  Keeps temperature low for
+      factual fidelity and instructs the model to be concise.
+    priority: 25
+    is_active: true
+    condition:
+      query_pattern: "(?i)\\b(summarise|summarize|summary|tldr|tl;dr|brief|overview|recap|key\\s+points|main\\s+ideas|gist)\\b"
+    action:
+      system_prompt_addon: >
+        The user wants a summary.  Follow these guidelines:
+        1. Provide a concise summary using bullet points.
+        2. Limit the summary to the most important facts and findings.
+        3. Do not introduce information not present in the retrieved context.
+        4. Keep the total length under 300 words unless the user asks for more.
+      temperature_override: 0.1
+      max_tokens_override: 1024
+      require_citations: true
+
+  # ── 5. Search / lookup queries ──
+  - rule_id: "search_query"
+    name: "Search / Lookup Handler"
+    description: >
+      Fires on explicit lookup-style queries ("find", "search", "list",
+      "show me", "where is").  Encourages the model to return a list of
+      matching items rather than a narrative paragraph.
+    priority: 30
+    is_active: true
+    condition:
+      query_pattern: "(?i)\\b(find|search|look\\s*up|locate|list|show\\s+me|where\\s+is|which\\s+files?|retrieve)\\b"
+    action:
+      system_prompt_addon: >
+        The user is searching for specific information.  When answering:
+        1. Present results as a numbered or bulleted list.
+        2. Include source references (file, page, section) for each item.
+        3. If no matching information is found, state that clearly.
+      temperature_override: 0.1
+      require_citations: true

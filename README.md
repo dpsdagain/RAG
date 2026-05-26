@@ -82,6 +82,10 @@ The design of the system is divided into 7 sequential phases:
 | **Phase 5** | [Implementation Roadmap](./rag_phase_5_implementation_roadmap_2026.md) | Step-by-step rollout plan (MVP to production-grade) highlighting critical evaluation metrics, latencies, and performance benchmarks. |
 | **Phase 6** | [Architectural Self-Critique](./rag_phase_6_self_critique_2026.md) | Hard-nosed critique of potential bottlenecks, API dependencies, and complexity traps, presenting the **V2 Elite Pivot** optimizations. |
 | **Phase 7** | [Technical Specification](./rag_phase_7_technical_specification_2026.md) | Complete implementation-grade engineering specification (folders, schemas, workers, router logic, memory engine rules, security, APIs). |
+| **V3 Spec** | [V3 Implementation Architecture](./rag_v3_implementation_architecture.md) | **CURRENT — Supersedes Phase 7.** Audit-validated spec incorporating all 24 fully-implementable components (hybrid retrieval, CRAG, episodic memory, citation, semantic chunking, MCP). |
+| **Backlog** | [API-Dependent Feature Backlog](./rag_v3_api_dependent_backlog.md) | 13 partially-implementable features requiring cloud API cost evaluation (KG extraction, Whisper, SPLADE, sleep-time compute, video processing). |
+| **Audit** | [Architecture Audit](../../../.gemini/antigravity/brain/bbaa9a99-c150-4351-91d1-24644d4963f3/rag_architecture_audit.md) | Principal-level 8-part audit of the full architecture. |
+| **Feasibility** | [Hardware Feasibility Analysis](../../../.gemini/antigravity/brain/bbaa9a99-c150-4351-91d1-24644d4963f3/hardware_feasibility_analysis.md) | Component-by-component YES/NO/PARTIAL analysis against 16GB RAM / 0 VRAM. |
 
 ---
 

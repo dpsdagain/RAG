@@ -1,0 +1,87 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# RAG System – Master Configuration
+#
+# Every key here can be overridden via environment variables using the RAG_
+# prefix and double-underscore for nesting.
+#   e.g.  RAG_LLM__MODEL=llama3.1  overrides  llm.model
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Persistent storage ──
+database:
+  db_path: "./data/rag.db"
+
+# ── Embedding model (ONNX Runtime) ──
+embedding:
+  model_path: "BAAI/bge-small-en-v1.5"
+  dim: 384
+  onnx_threads: 4
+  batch_size: 64
+
+# ── LLM provider ──
+llm:
+  provider: "openai"                  # mapped to openai to utilize token authentication
+  base_url: "https://ollama.com/v1"
+  model: "gpt-oss:120b-cloud"
+  api_key: ""                         # REDACTED: DO NOT COMMIT API KEYS
+  temperature: 0.1
+  max_tokens: 2048
+  timeout_seconds: 60
+
+# ── LlamaParse cloud parsing (optional) ──
+llamaparse:
+  api_key: ""
+
+# ── Cloud VLM for image-heavy documents (optional) ──
+cloud_vlm:
+  provider: "gemini"                  # gemini | openai
+  api_key: ""
+
+# ── Retrieval pipeline ──
+retrieval:
+  dense_top_k: 50
+  sparse_top_k: 50
+  rrf_k: 60
+  rrf_top_n: 100
+  rerank_top_k: 15
+  context_budget_tokens: 12000
+  rerank_model: "ms-marco-MiniLM-L-12-v2"
+
+# ── Advanced pipeline features ──
+pipeline:
+  crag_enabled: true
+  decomposition_enabled: true
+  faithfulness_check_enabled: true
+
+# ── Memory subsystem ──
+memory:
+  working_memory_max_turns: 10
+  episodic_memory_top_k: 3
+
+# ── Semantic cache ──
+cache:
+  max_entries: 500
+  similarity_threshold: 0.95
+  ttl_seconds: 3600
+
+# ── Chunking strategy ──
+chunking:
+  max_chunk_tokens: 512
+  min_chunk_tokens: 50
+  semantic_threshold: 0.3
+
+# ── HTTP server ──
+server:
+  host: "0.0.0.0"
+  port: 8000
+  api_key: "change-me-in-production"
+
+# ── Observability ──
+observability:
+  log_level: "INFO"
+  log_file: "./logs/rag.log"
+
+# ── Document ingestion ──
+ingestion:
+  watch_directory: ""                 # leave empty to disable directory watcher
+  batch_size: 32
+  max_file_size_mb: 100

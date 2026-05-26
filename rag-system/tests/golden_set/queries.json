@@ -1,0 +1,27 @@
+[
+  {
+    "query": "What is retrieval-augmented generation?",
+    "type": "simple_retrieval",
+    "expected_keywords": ["retrieval", "generation", "LLM"]
+  },
+  {
+    "query": "How does chunking affect retrieval quality?",
+    "type": "simple_retrieval",
+    "expected_keywords": ["chunk", "retrieval"]
+  },
+  {
+    "query": "Compare dense and sparse retrieval methods",
+    "type": "complex_retrieval",
+    "expected_keywords": ["dense", "sparse", "BM25", "vector"]
+  },
+  {
+    "query": "hello",
+    "type": "conversational",
+    "expected_keywords": []
+  },
+  {
+    "query": "What are the advantages of ONNX runtime vs PyTorch for CPU inference, and how does quantization affect accuracy?",
+    "type": "complex_retrieval",
+    "expected_keywords": ["ONNX", "PyTorch", "quantization"]
+  }
+]
