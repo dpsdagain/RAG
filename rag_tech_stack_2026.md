@@ -2,7 +2,7 @@
 ## Definitive Stack Recommendations & Personalized Blueprint
 
 > [!NOTE]
-> This document selects the optimal technology stack for a single, highly technical advanced user in late-2026, comparing the absolute frontier models (GPT-5.5, Claude Opus 4.7, Gemini 3.5 Flash) and providing 5 distinct blueprints, **plus a personalized blueprint optimized for a 16GB RAM / 2GB VRAM machine.**
+> This document selects the optimal technology stack for a single, highly technical advanced user in late-2026, comparing the absolute frontier models (GPT-5.5, Claude Opus 4.7, Gemini 3.5 Flash) and providing 5 distinct blueprints, **plus a personalized blueprint optimized for a 16GB RAM / 0 VRAM baseline.**
 
 ---
 
@@ -72,10 +72,11 @@
 ---
 
 # Part III — 🏆 YOUR PERSONALIZED STACK
-### Optimized for 16GB RAM / 2GB VRAM + Ollama Cloud
+### Optimized for 16GB RAM / 0 VRAM Baseline
 
 > [!CAUTION]
 > The reality of 2GB VRAM is that running any frontier LLM, cross-encoder reranker, or vision model locally will instantly bottleneck your machine, spill over into your 16GB system RAM, and run at an agonizing <1 token per second.
+> **Conclusion:** VRAM is treated as 0. Embeddings and reranking run on CPU; the only cloud call is generation.
 
 To solve this, we are using a **"Thin-Client" Orchestration Pattern**. This is a highly optimized blend of the *Low-Cost Stack* and the *Serverless Stack*. 
 
@@ -84,19 +85,25 @@ Your local machine manages the logic, state, and lightweight database, while hea
 | Component | Selection | Where it runs | Why it works for you |
 |---|---|---|---|
 | **Orchestrator** | **LangGraph** | **Local** | It's just Python code. It uses virtually zero RAM/VRAM and gives you total control over the agent logic locally. |
-| **Database** | **sqlite-vec** (or LanceDB) | **Local** | Runs as a single file on your SSD. It sips your 16GB of system RAM without needing a heavy background server like Docker. |
-| **Embeddings** | **Jina v5-text-small** | **Local** | This model is tiny enough that it *can* fit inside your 2GB VRAM, giving you fast, free local vector generation. |
+| **Database** | **sqlite-vec** | **Local** | Runs as a single file on your SSD. It sips your 16GB of system RAM without needing a heavy background server like Docker. |
+| **Embeddings** | **MiniLM-L6 (384-dim)** | **Local CPU** | Small enough to run on CPU at ~5-20 ms/query and embed your corpus in minutes; VRAM not used. |
 | **Primary LLM** | **Ollama Cloud** | **Cloud** | Offloads 100% of the VRAM-heavy reasoning and generation to the cloud, preventing your machine from freezing. |
-| **Reranker** | **Cohere Rerank API** | **Cloud** | Cross-encoders require heavy matrix math. Offload this to their API to perfectly sort your retrieved chunks. |
-| **Parsing** | **LlamaParse API** | **Cloud** | Parsing complex PDFs locally with vision models will crash your VRAM. Offloading this ensures you get clean text back instantly. |
+| **Reranker** | **FlashRank (Local CPU, default) + Cohere optional** | **Local/Cloud** | FlashRank handles 100->15 reranking on CPU instantly. Cohere provides an optional cross-encoder precision upgrade. |
+| **Parsing** | **PyMuPDF local (text PDFs) / LlamaParse cloud (scanned/complex)** | **Local+Cloud** | Local PyMuPDF saves cloud costs. Offloading complex visual PDFs ensures you get clean text back instantly without crashing local memory. |
+
+### Carried forward vs. dropped from the ideal phases
+
+To ensure this build is strictly feasible on the 0-VRAM constraint, several theoretical techniques from Phase 2 have been structurally dropped:
+*   **Late Chunking:** Dropped. (CPU cannot run a full-document long-context embedding pass). Replaced with Semantic Markdown Splitting.
+*   **Self-RAG (Reflection Tokens):** Dropped. (Requires a custom fine-tuned model running locally).
+*   **ColPali / Multimodal Retrieval:** Dropped for v1. (Too heavy for CPU).
+*   **Speculative RAG:** Dropped. (No fast local drafter model available in 0-VRAM).
 
 ### The Data Flow Architecture:
 1. **User Input:** You ask a complex question on your local machine.
 2. **Orchestration (Local):** LangGraph (running locally) receives the query.
-3. **Embedding (Local):** The query is converted to a vector using the tiny local Jina model.
+3. **Embedding (Local):** The query is converted to a vector using the tiny local MiniLM-L6 CPU model.
 4. **Retrieval (Local):** `sqlite-vec` quickly scans your local hard drive for the top 100 matches.
-5. **Reranking (Cloud):** LangGraph sends those 100 chunks to Cohere's API. Cohere returns the top 5 most relevant chunks.
-6. **Synthesis (Cloud):** LangGraph sends your prompt + the 5 chunks to Ollama Cloud.
+5. **Reranking (Local):** FlashRank reranks those 100 chunks down to the top 15 on CPU.
+6. **Synthesis (Cloud):** LangGraph sends your prompt + the top chunks to Ollama Cloud.
 7. **Response (Local):** Ollama Cloud streams the final answer back to your local UI.
-
-By keeping the **Orchestrator and Database local**, but pushing the **Parsing, LLM generation, and Reranking to the cloud**, your computer will feel incredibly fast while you build an elite 2026 RAG system.

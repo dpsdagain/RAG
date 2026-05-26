@@ -6,44 +6,44 @@
 
 Welcome to the definitive architecture and implementation roadmap for an elite, high-performance **Agentic RAG System** designed for late-2026 deployment. 
 
-This repository hosts a complete 7-phase system design and engineering blueprint optimized for constrained local hardware (**16 GB RAM / 2 GB VRAM / CPU-first architecture**) using the **Thin-Client Orchestration Pattern**.
+This repository hosts a complete 7-phase system design and engineering blueprint optimized for constrained local hardware (**16 GB RAM / 0 VRAM / CPU-first architecture**) using the **Thin-Client Orchestration Pattern**.
 
 ---
 
 ## ✨ Key Features & Capabilities
 
-*   **Multi-Modal Ingestion:** Seamlessly parses complex PDFs (with tables), codebases (with AST extraction), and websites.
+*   **Multi-Modal Ingestion:** Seamlessly parses complex PDFs (PyMuPDF + LlamaParse for scanned/complex), codebases (with AST extraction), and websites.
 *   **Self-Correcting Agentic Loops:** Uses LangGraph to automatically critique and re-retrieve context if the first pass fails.
-*   **Long-Term Graph Memory:** Remembers your preferences and past conversations using Graphiti knowledge graphs, complete with automated temporal decay for outdated rules.
-*   **Two-Stage Reranking:** Merges dense and sparse vectors locally, reranks using CPU-bound `FlashRank`, and finalizes precision with Cohere Cross-Encoders.
-*   **Graceful Degradation:** Achieves 100% uptime. If cloud APIs fail, it automatically falls back to a 1.5B quantized micro-model running locally in your system RAM.
+*   **Long-Term Memory:** Maintains a user-editable preference memory with optional chronological decay.
+*   **Two-Stage Reranking:** Merges dense and sparse vectors locally, runs Local CPU FlashRank reranking, and allows an optional Cohere cross-encoder pass.
+*   **Graceful Degradation:** On generation-API failure, it retries and then surfaces the ranked source evidence back to the user, preventing a crash while avoiding dangerous micro-model hallucinations.
 
 ---
 
 ## 🚀 The Thin-Client Paradigm
 
-Running state-of-the-art vision parsers, heavy cross-encoder rerankers, or large reasoning LLMs locally on a 2GB VRAM machine causes severe performance degradation, memory thrashing, and OS swapping. 
+Running state-of-the-art vision parsers, heavy cross-encoder rerankers, or large reasoning LLMs locally on a CPU causes severe performance degradation, memory thrashing, and OS swapping. 
 
-This system resolves those limitations by keeping **logic, routing, state, and vector databases local** while offloading heavy matrix compute to **highly-responsive cloud APIs and Ollama Cloud**.
+This system resolves those limitations by keeping **logic, routing, state, and vector databases local** while offloading heavy LLM reasoning and generation to **highly-responsive cloud APIs and Ollama Cloud**.
 
 ```mermaid
 graph TD
-    subgraph "Local Machine (16GB RAM / 2GB VRAM)"
+    subgraph "Local Machine (16GB RAM / 0 VRAM)"
         UI["User Interface (CLI/Web)"]
         Orchestrator["LangGraph Orchestrator (Python)"]
-        LocalEmbed["Jina v5-text-small (2GB VRAM)"]
+        LocalEmbed["MiniLM-L6 (CPU)"]
         
         subgraph "Local Storage Layer"
             VecDB["sqlite-vec (Vector DB)"]
             DocStore["SQLite (Raw Docs)"]
-            StateDB["PostgresSaver (Agent State)"]
+            StateDB["SQLite Checkpointer (Agent State)"]
         end
     end
 
     subgraph "Cloud Compute & APIs"
         Ollama["Ollama Cloud (LLM Reasoning & Generation)"]
-        LlamaParse["LlamaParse API (VLM Parsing)"]
-        Cohere["Cohere API (Cross-Encoder Reranking)"]
+        LlamaParse["LlamaParse API (VLM Parsing, Optional)"]
+        Cohere["Cohere API (Cross-Encoder Reranking, Optional)"]
     end
 
     UI <--> Orchestrator
@@ -54,8 +54,8 @@ graph TD
     Orchestrator <--> StateDB
 
     Orchestrator <--> Ollama
-    Orchestrator <--> LlamaParse
-    Orchestrator <--> Cohere
+    Orchestrator -.- LlamaParse
+    Orchestrator -.- Cohere
 ```
 
 ---
@@ -67,11 +67,11 @@ The design of the system is divided into 7 sequential phases:
 | Phase / File | Title | Description |
 | :--- | :--- | :--- |
 | **Phase 1** | [State of the Art (2026)](./rag_state_of_the_art_2026.md) | Deep-dive research into 2026 RAG frontiers (Subquadratic architectures, late chunking, sparse/dense hybrid, CoALA agent memory). |
-| **Phase 2** | [Initial Architecture](./rag_architecture_2026.md) | Draft layout of the thin-client architecture, memory layouts, database considerations, and parsing techniques. |
-| **Phase 3** | [Technology Stack](./rag_tech_stack_2026.md) | Definitive tech stack blueprint tailored precisely for 16GB RAM / 2GB VRAM limits (Jina, `sqlite-vec`, LangGraph, Cohere, LlamaParse). |
+| **Phase 2** | [Initial Architecture](./rag_architecture_2026.md) | Draft layout of the ideal architecture, memory layouts, database considerations, and parsing techniques. |
+| **Phase 3** | [Technology Stack](./rag_tech_stack_2026.md) | Definitive tech stack blueprint tailored precisely for 16GB RAM / 0 VRAM limits (MiniLM-L6 CPU, `sqlite-vec`, LangGraph). |
 | **Phase 4** | [Final Architecture Maps](./rag_final_architecture_2026.md) | Detailed Mermaid blueprints covering system design, sequence data flow, memory hierarchies, ingestion pipelines, and agent communication. |
 | **Phase 5** | [Implementation Roadmap](./rag_phase_5_implementation_roadmap_2026.md) | Step-by-step rollout plan (MVP to production-grade) highlighting critical evaluation metrics, latencies, and performance benchmarks. |
-| **Phase 6** | [Architectural Self-Critique](./rag_phase_6_self_critique_2026.md) | Hard-nosed critique of potential network bottlenecks, API dependencies, and complexity traps, presenting the **V2 Elite Pivot** optimizations. |
+| **Phase 6** | [Architectural Self-Critique](./rag_phase_6_self_critique_2026.md) | Hard-nosed critique of potential bottlenecks, API dependencies, and complexity traps, presenting the **V2 Elite Pivot** optimizations. |
 | **Phase 7** | [Technical Specification](./rag_phase_7_technical_specification_2026.md) | Complete implementation-grade engineering specification (folders, schemas, workers, router logic, memory engine rules, security, APIs). |
 
 ---
@@ -79,10 +79,10 @@ The design of the system is divided into 7 sequential phases:
 ## 🛠️ The V2 Elite Architecture Highlights
 
 The **V2 Architecture** (detailed in Phase 6 & Phase 7) resolves standard RAG failure points with:
-1. **Two-Stage Reranking:** Rather than uploading 100 chunks over the network to Cohere (causing massive HTTP latency), the system leverages a local CPU-bound `FlashRank` pass to trim down to 15 chunks before calling the cloud reranker.
-2. **Graceful Degradation:** A CPU-only `llama.cpp` instance running a heavily quantized 1.5B micro-model (e.g. Qwen2.5-1.5B) resides in local system RAM. If Ollama Cloud suffers latency or drops connection, the orchestrator routes to the local model to achieve 100% uptime.
-3. **Confidence-Based Routing:** Simple conversational queries or highly-confident search matches bypass expensive multi-agent LangGraph cycles to save API costs and speed up response times.
-4. **Decoupled Asynchronous Ingestion:** An independent background worker handles heavy PDF ingestion and LlamaParse webhooks without blocking the main UI thread.
+1. **Two-Stage Reranking:** Rather than sending 100 chunks over the network to a cloud cross-encoder (which incurs massive API inference costs and latency), the system leverages a local CPU-bound `FlashRank` pass to trim down to 15 chunks before (optionally) calling the cloud reranker.
+2. **Graceful Degradation:** The generation LLM is the only mandatory cloud call. If it times out or drops connection, the orchestrator routes the retrieved and ranked evidence directly back to the user instead of crashing.
+3. **Confidence-Based Routing:** Simple conversational queries or highly-confident search matches bypass expensive multi-agent LangGraph cycles to save API costs and speed up CPU response times.
+4. **Decoupled Asynchronous Ingestion:** An independent in-process background worker handles heavy PDF ingestion without blocking the main UI thread, pausing when active queries need CPU resources.
 
 ---
 
@@ -91,22 +91,22 @@ The **V2 Architecture** (detailed in Phase 6 & Phase 7) resolves standard RAG fa
 *   **Orchestrator:** LangGraph (cyclical, state-managed)
 *   **Vector Database:** `sqlite-vec` (extremely lightweight, C-extension for SQLite)
 *   **Keyword Search:** SQLite FTS5 (BM25)
-*   **Embeddings:** `Jina v5-text-small` (local, fits comfortably inside 2GB VRAM)
-*   **Parser:** LlamaParse API (cloud VLM parsing for complex markdown/tables)
-*   **Reranker:** `FlashRank` (Local Stage 1) + Cohere Rerank API (Cloud Stage 2)
-*   **Primary LLM:** Ollama Cloud (Cloud) / Quantized local models on CPU (Fallback)
-*   **Agent State:** `PostgresSaver` / SQLite Checkpointer
-*   **Long-Term Memory:** Graphiti (Temporal Knowledge Graphs)
+*   **Embeddings:** `MiniLM-L6` (Local CPU, fast and lightweight)
+*   **Parser:** PyMuPDF (Local Text) / LlamaParse API (Cloud VLM for complex markdown/tables)
+*   **Reranker:** `FlashRank` (Local CPU Stage 1) + Cohere Rerank API (Cloud Stage 2, Optional)
+*   **Primary LLM:** Ollama Cloud (Cloud)
+*   **Agent State:** SQLite Checkpointer
+*   **Long-Term Memory:** SQLite KV (Versioned preferences)
 
 ---
 
 ## 📋 Prerequisites
 
 Before implementing the specification, ensure your local environment meets the following baseline requirements:
-*   **Hardware:** 16 GB RAM, 2 GB VRAM, 500 GB SSD.
-*   **Software:** Python 3.11+, Docker Desktop, Git.
-*   **Local Services:** Ollama installed locally.
-*   **API Keys Required:** Cohere API (Reranking), LlamaParse (VLM Ingestion).
+*   **Hardware:** 16 GB RAM, 500 GB SSD. (VRAM not required - CPU-first architecture).
+*   **Software:** Python 3.11+, Git.
+*   **API Keys Required:** Generation LLM API (e.g., Ollama Cloud, OpenAI, Anthropic).
+*   *Optional API Keys:* Cohere API (precision reranking), LlamaParse (complex scanned PDFs).
 
 ---
 
@@ -119,7 +119,11 @@ To proceed to building this production-grade RAG agent, follow the domain-driven
 git clone https://github.com/dpsdagain/RAG.git
 cd RAG
 
-# Initialize local environment & config
+# Initialize local Python environment
+python -m venv venv
+source venv/bin/activate  # Or .\venv\Scripts\activate on Windows
+
+# Initialize config
 cp configs/config.example.yaml configs/config.yaml
 ```
 

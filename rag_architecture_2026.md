@@ -4,6 +4,9 @@
 > [!NOTE]
 > This document outlines the definitive production-grade architecture for an elite, single-power-user RAG system in 2026. It discards toy framework abstractions in favor of a decoupled, highly optimized, multi-agent reasoning engine built on state-of-the-art 2026 technologies.
 
+> [!IMPORTANT]
+> This phase describes the unconstrained 2026 frontier; see Phase 3's 'Carried forward vs. dropped' for what the CPU-first build actually uses.
+
 ---
 
 ## A. INGESTION PIPELINE
