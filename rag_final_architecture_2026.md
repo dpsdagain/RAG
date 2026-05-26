@@ -118,7 +118,7 @@ graph BT
 graph TD
     Query["User Query"] --> Router{"Confidence Router"}
     
-    Router -->|Confidence > 0.85| DirectSearch["Standard Search"]
+    Router -->|High Confidence| DirectSearch["Standard Search"]
     Router -->|Low Confidence| Decomp["Query Decomposition"]
     
     Decomp --> SubQ1["Sub-Query 1"]
@@ -130,34 +130,35 @@ graph TD
     
     Hybrid --> RRF["Reciprocal Rank Fusion (RRF)<br>Merge Results"]
     RRF --> FlashRankRerank["FlashRank<br>(Local CPU)"]
-    FlashRankRerank --> Threshold{"Relevance > 0.8?"}
+    FlashRankRerank --> Evaluator{"Context Evaluator<br>Passes?"}
     
-    Threshold -->|Yes| Final["Final Context Payload"]
-    Threshold -->|No| Fallback["Return Raw Evidence or Clarify"]
+    Evaluator -->|Yes| Final["Final Context Payload"]
+    Evaluator -->|No| Fallback["Trigger Rewrite/CRAG"]
 ```
 
 ---
 
-### 5. Agent Communication Flow
-*The LangGraph cyclic state machine. (Invoked only on low-confidence route).*
+### 5. Linear Pipeline Orchestration
+*The predictable linear pipeline replacing the cyclical multi-agent graph.*
 
 ```mermaid
 graph TD
-    Supervisor{"Supervisor Agent"}
+    Start["User Query"] --> Retrieve["Hybrid Retrieval Phase"]
     
-    ResearchAgent["Research Sub-Agent<br>(Vector Search)"]
-    Critic["Evaluator / Critic"]
+    Retrieve --> Rerank["FlashRank Reranking"]
     
-    Supervisor -->|Routes to| ResearchAgent
+    Rerank --> Evaluate{"Context Evaluator Node"}
     
-    ResearchAgent -->|Returns data| Supervisor
+    Evaluate -->|Context is Good| Generate["Final Generation (Ollama)"]
     
-    Supervisor -->|Requests Review| Critic
-    Critic -->|Passes| End["Final Generation"]
-    Critic -->|Fails: 'Needs more info'<br>(Max 2 loops)| Supervisor
+    Evaluate -->|Context Poor| Rewrite["Targeted Query Rewrite<br>(Max 1 Retry)"]
+    Rewrite --> Retrieve
     
-    classDef agent fill:#44337a,stroke:#b794f4,color:#faf5ff
-    class Supervisor,ResearchAgent,Critic agent
+    Evaluate -->|Context Poor (After Retry)| Fallback["CRAG Web Fallback<br>(Tavily)"]
+    Fallback --> Generate
+    
+    classDef pipe fill:#44337a,stroke:#b794f4,color:#faf5ff
+    class Retrieve,Rerank,Evaluate,Rewrite,Fallback pipe
 ```
 
 ---
@@ -170,20 +171,18 @@ graph LR
     subgraph "Local Disk (Persistent)"
         VDB[("sqlite-vec<br>(Embeddings & Metadata)")]
         SQL[("SQLite<br>(Raw Doc Markdown)")]
-        PG[("SQLite Checkpointer<br>(LangGraph Checkpoints)")]
+        PG[("SQLite Checkpointer<br>(Pipeline State)")]
     end
     
     subgraph "System RAM (16GB) - Transient"
         InMemCache["In-process cache (dict)"]
-        ActiveGraph["Active LangGraph State"]
-        EmbModel["Embedder Weights<br>(~0.5 GB CPU)"]
+        ActivePipe["Active Pipeline State"]
     end
 
-    ActiveGraph -->|Reads/Writes| PG
-    ActiveGraph -->|Reads| SQL
-    ActiveGraph -->|Searches| VDB
-    ActiveGraph -->|Checks| InMemCache
-    ActiveGraph -->|Passes strings to| EmbModel
+    ActivePipe -->|Reads/Writes| PG
+    ActivePipe -->|Reads| SQL
+    ActivePipe -->|Searches| VDB
+    ActivePipe -->|Checks| InMemCache
 ```
 
 ---
@@ -209,9 +208,9 @@ graph TD
     
     ChunkText --> CohereEmbed["Cohere Embedding API<br>(embed-english-v3.0)"]
     
-    BgeEmbed -->|Dense Vectors| VecDB[("sqlite-vec")]
+    CohereEmbed -->|Dense Vectors| VecDB[("sqlite-vec")]
     ChunkText -->|Raw Text| SQL[("Document Store")]
     
     classDef pipe fill:#1a202c,stroke:#a0aec0,color:#f7fafc
-    class Input,Cleaner,SemanticChunking,ChunkText,BgeEmbed pipe
+    class Input,Cleaner,SemanticChunking,ChunkText,CohereEmbed pipe
 ```
