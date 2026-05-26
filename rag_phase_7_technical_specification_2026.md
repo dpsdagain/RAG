@@ -57,9 +57,10 @@ The entire storage layer relies on SQLite extended with `sqlite-vec`.
 *   `chunk_id` (UUID, Primary Key)
 *   `doc_id` (UUID, Foreign Key -> documents)
 *   `content` (Text, the raw chunk)
-*   `embedding` (F32_BLOB, sqlite-vec dimension=384 for confirmed embedder: MiniLM-L6)
+*   `embedding` (F32_BLOB, sqlite-vec dimension=384 for confirmed embedder: bge-small-en-v1.5)
 *   `bm25_tokens` (Text, tokenized representation for FTS5 keyword search)
 *   `chunk_index` (Integer, sequential order in document)
+*   `parent_chunk_id` (UUID, Optional, Foreign Key -> chunks)
 
 ### 2. State & Memory Store
 **Table: `working_memory`** (LangGraph State)
@@ -82,9 +83,9 @@ Ingestion runs via a **single in-process background worker** (using Python `thre
 
 ### Modality Specifications
 *   **PDF Ingestion:**
-    *   *Parser:* Attempt **PyMuPDF** local text extraction first. Route to the **LlamaParse API** *only* when local text-extraction coverage is below threshold (e.g., heavily scanned/complex).
+    *   *Parser:* Attempt **pymupdf4llm** local text extraction first. Route to the **LlamaParse API** *only* when local text-extraction coverage is below threshold (e.g., heavily scanned/complex).
     *   *Chunking:* Semantic Markdown Splitter.
-    *   *Embedding:* MiniLM-L6, CPU, ONNX-quantized (30–400 chunks/s batched).
+    *   *Embedding:* bge-small-en-v1.5, CPU, ONNX-quantized (30–400 chunks/s batched).
 *   **Codebase Ingestion:**
     *   *Parser:* Local Tree-sitter AST extraction.
 
@@ -101,11 +102,14 @@ The pipeline is optimized for maximum semantic precision running on local CPU re
     *   Dense Search (`sqlite-vec`) -> Top 50.
     *   Sparse Search (SQLite FTS5 BM25) -> Top 50.
     *   Merge via Reciprocal Rank Fusion (RRF) -> Top 100.
-3.  **Local Reranking (Local Stage 2 - Default Final):**
+3.  **Local Reranking (Local Stage 2):**
     *   Pass Top 100 to `FlashRank` (CPU bound, <200MB RAM).
-    *   Prune to Top 5.
-4.  **Cloud Reranking (Cloud Stage 3 - Optional Upgrade):**
-    *   Pass Top 15 + Query to Cohere API (Cross-Encoder) for maximum precision.
+    *   Prune to Top 15.
+4.  **Parent-Context Injection (Small-to-Big):**
+    *   For the Top 15 chunks, retrieve their associated `parent_chunk_id` content to inject broader surrounding context before final truncation.
+5.  **Final Reranking (Local/Cloud Stage 3):**
+    *   If Cohere is disabled: Take the Top 5 of the FlashRank 15.
+    *   If Cohere is enabled: Pass Top 15 + Query to Cohere API (Cross-Encoder) for maximum precision, pruning to Top 5.
 
 ### Thresholds
 *   **Relevance Threshold:** If maximum relevance < 0.8, trigger an "Anti-Hallucination" halt. Ask the user for clarification.
@@ -152,7 +156,7 @@ VRAM metrics are entirely eliminated. The relevant ceiling is Resident Set Size 
 *   **Logs:** Structural JSON logging via `structlog`.
 *   **Metrics Tracked:**
     *   `ttft_ms`: Time to first token.
-    *   `cpu_embed_ms`: CPU latency for MiniLM embedding.
+    *   `cpu_embed_ms`: CPU latency for bge-small-en-v1.5 embedding.
     *   `rerank_ms`: CPU latency for FlashRank.
     *   `rss_mb`: Resident process memory gauge.
     *   `hallucination_score`: Offline Ragas evaluation.
@@ -180,7 +184,7 @@ Optimized for a native deployment on a 16GB RAM Windows/Linux machine. **Docker 
 | :--- | :--- |
 | OS + browser (Windows floor) | ~4–5 GB |
 | Python + onnxruntime/torch-cpu loaded | ~1–2 GB |
-| Embedder resident (MiniLM-L6) | ~0.3–0.5 GB |
+| Embedder resident (bge-small-en-v1.5) | ~0.3–0.5 GB |
 | FlashRank reranker resident | ~0.2–0.5 GB |
 | sqlite-vec mmap working set | ~0.2–1.0 GB |
 | App + API buffers | ~0.5–1.0 GB |

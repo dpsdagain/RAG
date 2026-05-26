@@ -12,7 +12,7 @@ This repository hosts a complete 7-phase system design and engineering blueprint
 
 ## ✨ Key Features & Capabilities
 
-*   **Multi-Modal Ingestion:** Seamlessly parses complex PDFs (PyMuPDF + LlamaParse for scanned/complex), codebases (with AST extraction), and websites.
+*   **Multi-Modal Ingestion:** Seamlessly parses complex PDFs (pymupdf4llm + LlamaParse for scanned/complex), codebases (with AST extraction), and websites.
 *   **Self-Correcting Agentic Loops:** Uses LangGraph to automatically critique and re-retrieve context if the first pass fails.
 *   **Long-Term Memory:** Maintains a user-editable preference memory with optional chronological decay.
 *   **Two-Stage Reranking:** Merges dense and sparse vectors locally, runs Local CPU FlashRank reranking, and allows an optional Cohere cross-encoder pass.
@@ -31,7 +31,7 @@ graph TD
     subgraph "Local Machine (16GB RAM / 0 VRAM)"
         UI["User Interface (CLI/Web)"]
         Orchestrator["LangGraph Orchestrator (Python)"]
-        LocalEmbed["MiniLM-L6 (CPU)"]
+        LocalEmbed["bge-small-en-v1.5 (CPU)"]
         
         subgraph "Local Storage Layer"
             VecDB["sqlite-vec (Vector DB)"]
@@ -68,7 +68,7 @@ The design of the system is divided into 7 sequential phases:
 | :--- | :--- | :--- |
 | **Phase 1** | [State of the Art (2026)](./rag_state_of_the_art_2026.md) | Deep-dive research into 2026 RAG frontiers (Subquadratic architectures, late chunking, sparse/dense hybrid, CoALA agent memory). |
 | **Phase 2** | [Initial Architecture](./rag_architecture_2026.md) | Draft layout of the ideal architecture, memory layouts, database considerations, and parsing techniques. |
-| **Phase 3** | [Technology Stack](./rag_tech_stack_2026.md) | Definitive tech stack blueprint tailored precisely for 16GB RAM / 0 VRAM limits (MiniLM-L6 CPU, `sqlite-vec`, LangGraph). |
+| **Phase 3** | [Technology Stack](./rag_tech_stack_2026.md) | Definitive tech stack blueprint tailored precisely for 16GB RAM / 0 VRAM limits (bge-small-en-v1.5 CPU, `sqlite-vec`, LangGraph). |
 | **Phase 4** | [Final Architecture Maps](./rag_final_architecture_2026.md) | Detailed Mermaid blueprints covering system design, sequence data flow, memory hierarchies, ingestion pipelines, and agent communication. |
 | **Phase 5** | [Implementation Roadmap](./rag_phase_5_implementation_roadmap_2026.md) | Step-by-step rollout plan (MVP to production-grade) highlighting critical evaluation metrics, latencies, and performance benchmarks. |
 | **Phase 6** | [Architectural Self-Critique](./rag_phase_6_self_critique_2026.md) | Hard-nosed critique of potential bottlenecks, API dependencies, and complexity traps, presenting the **V2 Elite Pivot** optimizations. |
@@ -91,8 +91,8 @@ The **V2 Architecture** (detailed in Phase 6 & Phase 7) resolves standard RAG fa
 *   **Orchestrator:** LangGraph (cyclical, state-managed)
 *   **Vector Database:** `sqlite-vec` (extremely lightweight, C-extension for SQLite)
 *   **Keyword Search:** SQLite FTS5 (BM25)
-*   **Embeddings:** `MiniLM-L6` (Local CPU, fast and lightweight)
-*   **Parser:** PyMuPDF (Local Text) / LlamaParse API (Cloud VLM for complex markdown/tables)
+*   **Embeddings:** `bge-small-en-v1.5` (Local CPU, fast and lightweight)
+*   **Parser:** pymupdf4llm (Local Markdown-aware Text) / LlamaParse API (Cloud VLM for complex markdown/tables)
 *   **Reranker:** `FlashRank` (Local CPU Stage 1) + Cohere Rerank API (Cloud Stage 2, Optional)
 *   **Primary LLM:** Ollama Cloud (Cloud)
 *   **Agent State:** SQLite Checkpointer

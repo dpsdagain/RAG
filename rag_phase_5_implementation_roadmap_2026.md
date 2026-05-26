@@ -7,7 +7,7 @@ To ensure a smooth transition from a basic setup to an elite, agentic Thin-Clien
 ### Step 1: Core Foundation (MVP) - Priority: HIGH
 **Goal:** Establish the basic local-to-cloud pipeline and ensure end-to-end functionality without complex routing.
 *   **Action 1:** Set up the local Python native environment (`venv`), install `sqlite-vec`, and configure the document store with WAL mode.
-*   **Action 2:** Integrate `MiniLM-L6` for local embeddings and configure the `onnxruntime` CPU provider.
+*   **Action 2:** Integrate `bge-small-en-v1.5` for local embeddings and configure the `onnxruntime` CPU provider.
 *   **Action 3:** Connect to Cloud Ollama and set up a basic prompt for generative answering.
 *   **Action 4:** Build a basic CLI or Gradio UI to test the ingestion-retrieval-generation loop.
 
@@ -15,7 +15,7 @@ To ensure a smooth transition from a basic setup to an elite, agentic Thin-Clien
 **Goal:** Improve the quality of the context injected into the LLM.
 *   **Action 1:** Implement Hybrid Search (Dense Vectors via `sqlite-vec` + Keyword BM25).
 *   **Action 2:** Integrate `FlashRank` for local CPU Cross-Encoder Reranking of the top retrieved results.
-*   **Action 3:** Upgrade ingestion pipeline to use PyMuPDF natively and LlamaParse API as a fallback for complex formats.
+*   **Action 3:** Upgrade ingestion pipeline to use pymupdf4llm natively and LlamaParse API as a fallback for complex formats.
 *   **Action 4:** Implement Semantic Markdown splitting to preserve context across headers.
 
 ### Step 3: Agentic Orchestration & Memory - Priority: MEDIUM
@@ -37,8 +37,8 @@ To ensure a smooth transition from a basic setup to an elite, agentic Thin-Clien
 
 | Feature Category | MVP (Phase 1) | Advanced (Phases 2-4) |
 | :--- | :--- | :--- |
-| **Ingestion** | PyPDF / simple text extraction | PyMuPDF + LlamaParse API |
-| **Chunking** | Fixed-size (e.g., 512 tokens + overlap) | Semantic Markdown splitting on LlamaParse/PyMuPDF headers |
+| **Ingestion** | PyPDF / pymupdf4llm | pymupdf4llm + LlamaParse API |
+| **Chunking** | Fixed-size (e.g., 512 tokens + overlap) | Semantic Markdown splitting on LlamaParse/pymupdf4llm headers |
 | **Retrieval** | Single Dense Vector Search | Hybrid (BM25 + Dense) + Reciprocal Rank Fusion (RRF) |
 | **Reranking** | None (Raw DB scores) | FlashRank (Local CPU) |
 | **Orchestration** | Linear Script (Input -> VectorDB -> LLM) | LangGraph Cyclic Agent State Machine |
@@ -47,14 +47,14 @@ To ensure a smooth transition from a basic setup to an elite, agentic Thin-Clien
 ### Which Features Matter Most?
 1.  **Good Ingestion:** If your raw data is parsed poorly, no LLM will rescue it.
 2.  **Reranking (FlashRank):** Reranking provides the highest ROI for retrieval accuracy. Retrieving 100 docs locally and reranking them down drastically reduces hallucination.
-3.  **Local Embeddings (MiniLM-L6):** Keeping embeddings local saves massive API costs and ensures privacy for your semantic index.
+3.  **Local Embeddings (bge-small-en-v1.5):** Keeping embeddings local saves massive API costs and ensures privacy for your semantic index.
 
 ---
 
 ## 3. Common Mistakes & Pitfalls
 
 *   **Don't run *any* model on the GPU:** With a 0-VRAM baseline constraint, embeddings and reranking must run strictly on the CPU, while heavy generation is offloaded to the cloud. Trying to shoehorn models onto the GPU will break the system.
-*   **Ignoring Table and Image Data:** Standard PDF parsers destroy tables. Ensure the ingestion pipeline falls back to LlamaParse when PyMuPDF struggles.
+*   **Ignoring Table and Image Data:** Standard PDF parsers destroy tables. Ensure the ingestion pipeline falls back to LlamaParse when pymupdf4llm struggles.
 *   **"Blind" Retrieval:** Trusting the Vector DB's top 3 results without a Cross-Encoder Reranker usually results in sub-optimal context and hallucinations.
 *   **Agent Infinite Loops:** In LangGraph, failing to set strict exit conditions or max recursion depths for the Critic Agent can lead to endless loops and massive API bills.
 

@@ -35,7 +35,7 @@ While theoretically sound for hardware bypass, a rigorous evaluation reveals cri
 ## 3. Scaling Risks & Future-Proofing
 
 *   **Context Window Obsolescence:** In late-2026, API models handle 2M+ tokens natively. The risk here is over-engineering a highly complex retrieval and reranking pipeline when it might soon be cheaper to simply pass a massive chunk of the SQLite database directly into a cloud LLM.
-*   **CPU Contention:** Because this is a 0-VRAM architecture, everything except Generation runs on your CPU. If you drop a massive 500-page PDF into the ingestion folder, the local `MiniLM` embedder will consume all available CPU cores. If you attempt a query at the same time, your retrieval latency will jump from 50ms to 5,000ms.
+*   **CPU Contention:** Because this is a 0-VRAM architecture, everything except Generation runs on your CPU. If you drop a massive 500-page PDF into the ingestion folder, the local `bge-small` embedder will consume all available CPU cores. If you attempt a query at the same time, your retrieval latency will jump from 50ms to 5,000ms.
 
 ---
 ---
@@ -48,8 +48,8 @@ To mitigate these flaws, we must optimize API inference, simplify state manageme
 *   **The Fix:** Never send 100 chunks to a cloud cross-encoder.
 *   **The Implementation:**
     1. **Stage 1 (Local):** `sqlite-vec` + BM25 retrieves the Top 100.
-    2. **Stage 2 (Local):** Implement `FlashRank` (a nano-reranker running purely on CPU/RAM) to rerank the 100 chunks down to 15 instantly.
-    3. **Stage 3 (Cloud):** (Optional) Send only the top 15 chunks to Cohere for the final, precise Cross-Encoder rerank down to Top 5.
+    2. **Stage 2 (Local):** Implement `FlashRank` (a nano-reranker running purely on CPU/RAM) to rerank the 100 chunks down to the Top 15 instantly.
+    3. **Stage 3 (Cloud / Local Final):** If Cohere (optional) is enabled, send the Top 15 to Cohere for a precise cross-encoder rerank down to Top 5. If Cohere is disabled, simply take the Top 5 of the FlashRank 15.
 *   **Impact:** Cuts cloud inference latency and costs by 85%.
 
 ### Improvement 2: Graceful Degradation (Raw Evidence Fallback)

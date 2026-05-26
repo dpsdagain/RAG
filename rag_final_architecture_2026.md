@@ -14,7 +14,7 @@ graph TD
     subgraph "Local Machine (16GB RAM / 0 VRAM)"
         UI["User Interface (CLI/Web)"]
         Orchestrator["LangGraph Orchestrator (Python)"]
-        LocalEmbed["MiniLM-L6 (CPU)"]
+        LocalEmbed["bge-small-en-v1.5 (CPU)"]
         
         subgraph "Local Storage Layer"
             VecDB["sqlite-vec (Vector DB)"]
@@ -56,7 +56,7 @@ graph TD
 sequenceDiagram
     participant User
     participant LangGraph as LangGraph Orchestrator
-    participant Embed as MiniLM-L6 (Local CPU)
+    participant Embed as bge-small-en-v1.5 (Local CPU)
     participant VecDB as sqlite-vec (Local)
     participant FlashRank as FlashRank (Local CPU)
     participant Cohere as Cohere Rerank (Cloud, Optional)
@@ -75,7 +75,11 @@ sequenceDiagram
     LangGraph->>FlashRank: Rerank Top 100
     FlashRank-->>LangGraph: Returns Top-K=15 Chunks
     
-    opt High Precision Cloud Upgrade
+    opt If Cohere is DISABLED
+        LangGraph->>LangGraph: Truncate to Top-K=5 Chunks
+    end
+    
+    opt High Precision Cloud Upgrade (Cohere ENABLED)
         LangGraph-->>Cohere: Send 15 Chunks + Query for Reranking
         Cohere-->>LangGraph: Returns Top-K=5 Reranked Chunks
     end
@@ -193,21 +197,21 @@ graph TD
     
     Input --> PDFType{"Is PDF text-extractable?"}
     
-    PDFType -->|Yes (Text)| PyMuPDF["PyMuPDF<br>(Local CPU Parsing)"]
+    PDFType -->|Yes (Text)| pymupdf4llm["pymupdf4llm<br>(Local CPU Parsing)"]
     PDFType -->|No (Scanned/Complex)| LlamaParse{"LlamaParse API<br>(Cloud VLM Extraction)"}
     
-    PyMuPDF --> Cleaner["Local Text Cleaner<br>(Regex / Normalization)"]
+    pymupdf4llm --> Cleaner["Local Text Cleaner<br>(Regex / Normalization)"]
     LlamaParse --> Cleaner
     
     Cleaner --> SemanticChunking["Semantic Markdown Splitter"]
     
     SemanticChunking --> ChunkText["Context-Aware Chunks"]
     
-    ChunkText --> MiniLMEmbed["MiniLM-L6 Embedding Model<br>(CPU)"]
+    ChunkText --> BgeEmbed["bge-small-en-v1.5 Embedding Model<br>(CPU)"]
     
-    MiniLMEmbed -->|Dense Vectors| VecDB[("sqlite-vec")]
+    BgeEmbed -->|Dense Vectors| VecDB[("sqlite-vec")]
     ChunkText -->|Raw Text| SQL[("Document Store")]
     
     classDef pipe fill:#1a202c,stroke:#a0aec0,color:#f7fafc
-    class Input,Cleaner,SemanticChunking,ChunkText,MiniLMEmbed pipe
+    class Input,Cleaner,SemanticChunking,ChunkText,BgeEmbed pipe
 ```
