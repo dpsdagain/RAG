@@ -196,11 +196,11 @@ graph TD
     
     Input --> PDFType{"Is PDF text-extractable?"}
     
-    PDFType -->|Yes (Text)| pymupdf4llm["pymupdf4llm<br>(Local CPU Parsing)"]
-    PDFType -->|No (Scanned/Complex)| LlamaParse{"LlamaParse API<br>(Cloud VLM Extraction)"}
+    PDFType -->|Yes (Text)| ParserLocal["pymupdf4llm<br>(Local CPU Parsing)"]
+    PDFType -->|No (Scanned/Complex)| ParserCloud["LlamaParse API<br>(Cloud VLM Extraction)"]
     
-    pymupdf4llm --> Cleaner["Local Text Cleaner<br>(Regex / Normalization)"]
-    LlamaParse --> Cleaner
+    ParserLocal --> Cleaner["Local Text Cleaner<br>(Regex / Normalization)"]
+    ParserCloud --> Cleaner
     
     Cleaner --> SemanticChunking["Semantic Markdown Splitter"]
     
