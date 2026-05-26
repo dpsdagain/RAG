@@ -14,7 +14,7 @@ graph TD
     subgraph "Local Machine (16GB RAM / 0 VRAM)"
         UI["User Interface (CLI/Web)"]
         Orchestrator["LangGraph Orchestrator (Python)"]
-        LocalEmbed["bge-small-en-v1.5 (CPU)"]
+        APIEmbed["Cohere API (embed-english-v3.0)"]
         
         subgraph "Local Storage Layer"
             VecDB["sqlite-vec (Vector DB)"]
@@ -56,7 +56,7 @@ graph TD
 sequenceDiagram
     participant User
     participant LangGraph as LangGraph Orchestrator
-    participant Embed as bge-small-en-v1.5 (Local CPU)
+    participant Embed as Cohere API
     participant VecDB as sqlite-vec (Local)
     participant FlashRank as FlashRank (Local CPU)
     participant Cohere as Cohere Rerank (Cloud, Optional)
@@ -207,7 +207,7 @@ graph TD
     
     SemanticChunking --> ChunkText["Context-Aware Chunks"]
     
-    ChunkText --> BgeEmbed["bge-small-en-v1.5 Embedding Model<br>(CPU)"]
+    ChunkText --> CohereEmbed["Cohere Embedding API<br>(embed-english-v3.0)"]
     
     BgeEmbed -->|Dense Vectors| VecDB[("sqlite-vec")]
     ChunkText -->|Raw Text| SQL[("Document Store")]

@@ -57,21 +57,23 @@ The entire storage layer relies on SQLite extended with `sqlite-vec`.
 *   `chunk_id` (UUID, Primary Key)
 *   `doc_id` (UUID, Foreign Key -> documents)
 *   `content` (Text, the raw chunk)
-*   `embedding` (F32_BLOB, sqlite-vec dimension=384 for confirmed embedder: bge-small-en-v1.5)
+*   `embedding` (F32_BLOB, sqlite-vec dimension=1024 for confirmed embedder: Cohere embed-english-v3.0)
 *   `bm25_tokens` (Text, tokenized representation for FTS5 keyword search)
 *   `chunk_index` (Integer, sequential order in document)
 *   `parent_chunk_id` (UUID, Optional, Foreign Key -> chunks)
 
 ### 2. State & Memory Store
-**Table: `working_memory`** (LangGraph State)
+**Table: `working_memory`** (Linear Pipeline State)
 *   `thread_id` (UUID)
 *   `state_blob` (JSON)
 *   `written_at` (Timestamp)
 
-**Table: `user_preferences`** (Versioned preference store)
+**Table: `user_preferences`** (Episodic Mem0-style store)
 *   `pref_id` (UUID)
 *   `preference` (String)
-*   `last_accessed` (Timestamp, for optional decay)
+*   `created_at` (Timestamp)
+*   `supersedes_id` (UUID, Optional, points to outdated preference)
+*   `is_active` (Boolean)
 
 ---
 
@@ -85,7 +87,7 @@ Ingestion runs via a **single in-process background worker** (using Python `thre
 *   **PDF Ingestion:**
     *   *Parser:* Attempt **pymupdf4llm** local text extraction first. Route to the **LlamaParse API** *only* when local text-extraction coverage is below threshold (e.g., heavily scanned/complex).
     *   *Chunking:* Semantic Markdown Splitter.
-    *   *Embedding:* bge-small-en-v1.5, CPU, ONNX-quantized (30–400 chunks/s batched).
+    *   *Embedding:* Cohere `embed-english-v3.0` API (maximizes semantic recall vs local models).
 *   **Codebase Ingestion:**
     *   *Parser:* Local Tree-sitter AST extraction.
 
@@ -98,21 +100,21 @@ The pipeline is optimized for maximum semantic precision running on local CPU re
 ### Pipeline Flow
 1.  **Routing (Confidence-Based):** 
     *   If query is simple conversational -> Skip retrieval.
-2.  **Hybrid Retrieval (Local Stage 1):**
-    *   Dense Search (`sqlite-vec`) -> Top 50.
+2.  **Hybrid Retrieval (Stage 1):**
+    *   Dense Search (`sqlite-vec` via Cohere API) -> Top 50.
     *   Sparse Search (SQLite FTS5 BM25) -> Top 50.
     *   Merge via Reciprocal Rank Fusion (RRF) -> Top 100.
-3.  **Local Reranking (Local Stage 2):**
+3.  **Local Reranking (Stage 2):**
     *   Pass Top 100 to `FlashRank` (CPU bound, <200MB RAM).
     *   Prune to Top 15.
 4.  **Parent-Context Injection (Small-to-Big):**
     *   For the Top 15 chunks, retrieve their associated `parent_chunk_id` content to inject broader surrounding context before final truncation.
-5.  **Final Reranking (Local/Cloud Stage 3):**
-    *   If Cohere is disabled: Take the Top 5 of the FlashRank 15.
-    *   If Cohere is enabled: Pass Top 15 + Query to Cohere API (Cross-Encoder) for maximum precision, pruning to Top 5.
+5.  **Final Reranking & Web Fallback (Stage 3):**
+    *   Pass Top 15 + Query to Cohere API (Cross-Encoder) for maximum precision, pruning to Top 5.
+    *   **CRAG Web Fallback:** If the top reranked chunks fail the empirically calibrated confidence threshold, silently fallback to the **Tavily Web Search API** to fetch external context.
 
 ### Thresholds
-*   **Relevance Threshold:** If maximum relevance < 0.8, trigger an "Anti-Hallucination" halt. Ask the user for clarification.
+*   **Relevance Threshold:** Calibrated dynamically against a local Ragas evaluation Golden Set (no hardcoded cosine thresholds).
 
 ---
 
@@ -123,14 +125,14 @@ The pipeline is optimized for maximum semantic precision running on local CPU re
 
 ---
 
-## F. AGENT ORCHESTRATION
+## F. ORCHESTRATION: LINEAR PIPELINE
 
-Powered by **LangGraph** using an asynchronous cyclical graph, but explicitly optimized to avoid infinite loops and gracefully handle API failures.
+Replacing the complex multi-agent cyclical graph with a predictable **Linear Pipeline** (`Retrieve -> Rerank -> Evaluate Context -> Generate`).
 
 ### Orchestration Logic & Safeguards
-*   **Max Recursion:** Graph loops are hard-capped at 2 iterations.
-*   **Fallback Handling:** The generation LLM is the sole cloud dependency. On a generation timeout: trigger one retry with exponential backoff. If it still fails, LangGraph **gracefully degrades by returning the reranked Top-5 chunks as raw evidence** with a "generation unavailable" notice. 
-*   *Note: Running a 1.5B model locally on CPU yields ~5-15 tok/s and severe hallucination risks, thus honest degradation is preferred over a local micro-model.*
+*   **Self-Correction:** The context evaluator node assesses retrieved chunks. If they fail to answer the query, it triggers exactly **one** targeted query rewrite and retry.
+*   **Graceful Degradation:** If the retry fails, the pipeline gracefully degrades without infinite looping, returning a fallback response or basic web search results.
+*   **Fallback Handling:** The generation LLM and embedder are cloud dependencies. On API timeout: trigger one retry with exponential backoff. If it still fails, the pipeline degrades by returning the reranked chunks as raw evidence with an "API unavailable" notice.
 
 ---
 
@@ -184,12 +186,11 @@ Optimized for a native deployment on a 16GB RAM Windows/Linux machine. **Docker 
 | :--- | :--- |
 | OS + browser (Windows floor) | ~4–5 GB |
 | Python + onnxruntime/torch-cpu loaded | ~1–2 GB |
-| Embedder resident (bge-small-en-v1.5) | ~0.3–0.5 GB |
 | FlashRank reranker resident | ~0.2–0.5 GB |
 | sqlite-vec mmap working set | ~0.2–1.0 GB |
 | App + API buffers | ~0.5–1.0 GB |
-| **Total Warm System Allocation** | **~7–9 GB** |
-| **Available Headroom on 16 GB** | **~7 GB** |
+| **Total Warm System Allocation** | **~6.5–8.5 GB** |
+| **Available Headroom on 16 GB** | **~7.5 GB** |
 
 ### Boot Script (`start.ps1`)
 1.  Verifies available RSS headroom is sufficient for launch.

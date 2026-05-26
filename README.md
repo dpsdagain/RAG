@@ -31,7 +31,7 @@ graph TD
     subgraph "Local Machine (16GB RAM / 0 VRAM)"
         UI["User Interface (CLI/Web)"]
         Orchestrator["LangGraph Orchestrator (Python)"]
-        LocalEmbed["bge-small-en-v1.5 (CPU)"]
+        APIEmbed["Cohere API (embed-english-v3.0)"]
         
         subgraph "Local Storage Layer"
             VecDB["sqlite-vec (Vector DB)"]
@@ -68,7 +68,7 @@ The design of the system is divided into 7 sequential phases:
 | :--- | :--- | :--- |
 | **Phase 1** | [State of the Art (2026)](./rag_state_of_the_art_2026.md) | Deep-dive research into 2026 RAG frontiers (Subquadratic architectures, late chunking, sparse/dense hybrid, CoALA agent memory). |
 | **Phase 2** | [Initial Architecture](./rag_architecture_2026.md) | Draft layout of the ideal architecture, memory layouts, database considerations, and parsing techniques. |
-| **Phase 3** | [Technology Stack](./rag_tech_stack_2026.md) | Definitive tech stack blueprint tailored precisely for 16GB RAM / 0 VRAM limits (bge-small-en-v1.5 CPU, `sqlite-vec`, LangGraph). |
+| **Phase 3** | [Technology Stack](./rag_tech_stack_2026.md) | Definitive tech stack blueprint tailored precisely for 16GB RAM / 0 VRAM limits (Cohere API, `sqlite-vec`, Linear Pipeline). |
 | **Phase 4** | [Final Architecture Maps](./rag_final_architecture_2026.md) | Detailed Mermaid blueprints covering system design, sequence data flow, memory hierarchies, ingestion pipelines, and agent communication. |
 | **Phase 5** | [Implementation Roadmap](./rag_phase_5_implementation_roadmap_2026.md) | Step-by-step rollout plan (MVP to production-grade) highlighting critical evaluation metrics, latencies, and performance benchmarks. |
 | **Phase 6** | [Architectural Self-Critique](./rag_phase_6_self_critique_2026.md) | Hard-nosed critique of potential bottlenecks, API dependencies, and complexity traps, presenting the **V2 Elite Pivot** optimizations. |
@@ -91,7 +91,7 @@ The **V2 Architecture** (detailed in Phase 6 & Phase 7) resolves standard RAG fa
 *   **Orchestrator:** LangGraph (cyclical, state-managed)
 *   **Vector Database:** `sqlite-vec` (extremely lightweight, C-extension for SQLite)
 *   **Keyword Search:** SQLite FTS5 (BM25)
-*   **Embeddings:** `bge-small-en-v1.5` (Local CPU, fast and lightweight)
+*   **Embeddings:** `Cohere API` (embed-english-v3.0, high semantic quality)
 *   **Parser:** pymupdf4llm (Local Markdown-aware Text) / LlamaParse API (Cloud VLM for complex markdown/tables)
 *   **Reranker:** `FlashRank` (Local CPU Stage 1) + Cohere Rerank API (Cloud Stage 2, Optional)
 *   **Primary LLM:** Ollama Cloud (Cloud)

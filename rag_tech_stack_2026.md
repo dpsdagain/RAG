@@ -86,7 +86,7 @@ Your local machine manages the logic, state, and lightweight database, while hea
 |---|---|---|---|
 | **Orchestrator** | **LangGraph** | **Local** | It's just Python code. It uses virtually zero RAM/VRAM and gives you total control over the agent logic locally. |
 | **Database** | **sqlite-vec** | **Local** | Runs as a single file on your SSD. It sips your 16GB of system RAM without needing a heavy background server like Docker. |
-| **Embeddings** | **bge-small-en-v1.5 (384-dim)** | **Local CPU** | Small enough to run on CPU at ~5-20 ms/query and embed your corpus in minutes; VRAM not used. |
+| **Embeddings** | **Cohere embed-english-v3.0 (1024-dim)** | **Cloud API** | Massive recall upgrade over local models; offloads CPU constraint. |
 | **Primary LLM** | **Ollama Cloud** | **Cloud** | Offloads 100% of the VRAM-heavy reasoning and generation to the cloud, preventing your machine from freezing. |
 | **Reranker** | **FlashRank (Local CPU, default) + Cohere optional** | **Local/Cloud** | FlashRank handles 100->15 reranking on CPU instantly. Cohere provides an optional cross-encoder precision upgrade. |
 | **Parsing** | **pymupdf4llm local (text PDFs) / LlamaParse cloud (scanned/complex)** | **Local+Cloud** | Local pymupdf4llm (Markdown-aware) saves cloud costs and preserves headers for chunking. Offloading complex visual PDFs ensures you get clean text back instantly without crashing local memory. |
@@ -102,7 +102,7 @@ To ensure this build is strictly feasible on the 0-VRAM constraint, several theo
 ### The Data Flow Architecture:
 1. **User Input:** You ask a complex question on your local machine.
 2. **Orchestration (Local):** LangGraph (running locally) receives the query.
-3. **Embedding (Local):** The query is converted to a vector using the tiny local bge-small-en-v1.5 CPU model.
+3. **Embedding (API):** The query is converted to a vector using the Cohere API for high semantic precision.
 4. **Retrieval (Local):** `sqlite-vec` quickly scans your local hard drive for the top 100 matches.
 5. **Reranking (Local):** FlashRank reranks those 100 chunks down to the top 15 on CPU.
 6. **Synthesis (Cloud):** LangGraph sends your prompt + the top chunks to Ollama Cloud.

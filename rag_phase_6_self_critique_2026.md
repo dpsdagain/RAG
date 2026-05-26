@@ -35,7 +35,7 @@ While theoretically sound for hardware bypass, a rigorous evaluation reveals cri
 ## 3. Scaling Risks & Future-Proofing
 
 *   **Context Window Obsolescence:** In late-2026, API models handle 2M+ tokens natively. The risk here is over-engineering a highly complex retrieval and reranking pipeline when it might soon be cheaper to simply pass a massive chunk of the SQLite database directly into a cloud LLM.
-*   **CPU Contention:** Because this is a 0-VRAM architecture, everything except Generation runs on your CPU. If you drop a massive 500-page PDF into the ingestion folder, the local `bge-small` embedder will consume all available CPU cores. If you attempt a query at the same time, your retrieval latency will jump from 50ms to 5,000ms.
+*   **CPU Contention:** Because this is a 0-VRAM architecture, everything except Generation runs on your CPU. If you drop a massive 500-page PDF into the ingestion folder, it used to consume all cores. Now, the Cohere API will handle embeddings, keeping your local CPU completely free for FlashRank and ingestion routing.
 
 ---
 ---
