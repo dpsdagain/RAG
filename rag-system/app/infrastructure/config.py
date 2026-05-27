@@ -187,6 +187,20 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
     Returns:
         Validated Settings instance.
     """
+    # Load .env so RAG_* secrets reach os.environ before override merge.
+    # Existing env vars take precedence; .env only fills gaps.
+    try:
+        from dotenv import load_dotenv
+        for env_path in (
+            Path(__file__).resolve().parent.parent.parent / ".env",
+            Path.cwd() / ".env",
+        ):
+            if env_path.exists():
+                load_dotenv(env_path, override=False)
+                break
+    except ImportError:
+        pass
+
     data: dict[str, Any] = {}
 
     if config_path is None:

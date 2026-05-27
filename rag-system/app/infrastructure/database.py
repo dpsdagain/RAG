@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 import struct
 from dataclasses import asdict, dataclass, field
@@ -86,6 +87,23 @@ def _serialize_f32(vec: list[float]) -> bytes:
 def _deserialize_f32(blob: bytes, dim: int = 384) -> list[float]:
     """Deserialize a F32 binary blob back to a float list."""
     return list(struct.unpack(f"{dim}f", blob))
+
+
+_FTS5_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _sanitize_fts5_query(query: str) -> str:
+    """Escape a user-typed query for safe use with FTS5 MATCH.
+
+    FTS5 treats characters like ``?``, ``*``, ``:``, ``^``, ``-`` as query
+    operators. Wrapping each word token in double quotes makes them literal,
+    so a free-form user question like "What is the chunking strategy?"
+    becomes a safe OR-of-quoted-terms query.
+    """
+    tokens = _FTS5_TOKEN_RE.findall(query)
+    if not tokens:
+        return '""'
+    return " ".join(f'"{tok}"' for tok in tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -534,24 +552,37 @@ class Database:
     # ------------------------------------------------------------------
 
     async def vector_search(self, embedding: list[float], top_k: int = 50) -> list[ChunkResult]:
-        """Dense vector search using sqlite-vec cosine distance."""
+        """Dense vector search using sqlite-vec K-NN.
+
+        The K-NN runs as an isolated subquery on ``chunks_vec`` so the vec0
+        virtual table sees a simple ``MATCH ? LIMIT ?`` (its required form).
+        Joins to ``chunks``/``documents`` and the ``status`` filter happen
+        outside the K-NN, in the outer query. We over-fetch K-NN results
+        slightly so post-filtering active docs doesn't starve us.
+        """
         def _run() -> list[ChunkResult]:
             conn = self._get_connection()
             blob = _serialize_f32(embedding)
+            knn_limit = max(top_k * 2, top_k + 10)
             try:
                 rows = conn.execute(
                     """SELECT cv.chunk_id, cv.distance,
                               c.doc_id, c.content, c.chunk_index, c.parent_chunk_id,
                               c.section_title, c.source_page, c.token_count,
                               d.source_uri, d.source_type
-                       FROM chunks_vec cv
+                       FROM (
+                           SELECT chunk_id, distance
+                           FROM chunks_vec
+                           WHERE embedding MATCH ?
+                           ORDER BY distance
+                           LIMIT ?
+                       ) cv
                        JOIN chunks c ON c.chunk_id = cv.chunk_id
                        JOIN documents d ON d.doc_id = c.doc_id
                        WHERE d.status = 'active'
-                       AND cv.embedding MATCH ?
                        ORDER BY cv.distance
                        LIMIT ?""",
-                    (blob, top_k),
+                    (blob, knn_limit, top_k),
                 ).fetchall()
             except sqlite3.OperationalError as e:
                 logger.error("vector_search_failed", error=str(e))
@@ -559,8 +590,11 @@ class Database:
 
             results: list[ChunkResult] = []
             for row in rows:
-                # sqlite-vec returns distance; convert to similarity score
-                score = 1.0 - float(row["distance"])
+                # sqlite-vec's default metric is L2-squared. For L2-normalized
+                # vectors that maps to roughly [0, 4]; convert to a [0, 1]
+                # cosine-similarity-like score.
+                distance = float(row["distance"])
+                score = max(0.0, min(1.0, 1.0 - distance / 2.0))
                 results.append(ChunkResult(
                     chunk_id=row["chunk_id"], doc_id=row["doc_id"],
                     content=row["content"], score=score,
@@ -583,6 +617,8 @@ class Database:
 
     async def bm25_search(self, query: str, top_k: int = 50) -> list[ChunkResult]:
         """BM25 full-text search using FTS5."""
+        fts_query = _sanitize_fts5_query(query)
+
         def _run() -> list[ChunkResult]:
             conn = self._get_connection()
             try:
@@ -598,10 +634,10 @@ class Database:
                        AND d.status = 'active'
                        ORDER BY rank
                        LIMIT ?""",
-                    (query, top_k),
+                    (fts_query, top_k),
                 ).fetchall()
             except sqlite3.OperationalError as e:
-                logger.error("bm25_search_failed", error=str(e))
+                logger.error("bm25_search_failed", error=str(e), fts_query=fts_query)
                 return []
 
             results: list[ChunkResult] = []

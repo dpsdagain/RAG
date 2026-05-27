@@ -6,13 +6,19 @@ import json
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 
-from app.api.schemas import ChatRequest, ChatResponse, ChatStreamEvent, ErrorResponse
+from app.api.schemas import ChatRequest, ChatResponse, ErrorResponse
 
 router = APIRouter(prefix="/v1/chat", tags=["Chat"])
 
 
 async def _get_pipeline(request: Request):
     return request.app.state.pipeline
+
+
+def _format_sse(event_name: str, data) -> str:
+    """Encode an event as a proper SSE frame (named event + JSON data)."""
+    payload = json.dumps(data) if not isinstance(data, str) else json.dumps(data)
+    return f"event: {event_name}\ndata: {payload}\n\n"
 
 
 @router.post(
@@ -32,39 +38,16 @@ async def chat_completions(
     if body.stream:
         async def event_stream():
             try:
-                # For now, execute non-streaming and wrap as SSE
-                result = await pipeline.execute(
+                async for evt in pipeline.execute_stream(
                     query=body.query,
                     conversation_id=body.conversation_id,
-                    stream=False,
-                )
-                # Emit tokens
-                for i in range(0, len(result.response), 20):
-                    chunk = result.response[i:i + 20]
-                    event = ChatStreamEvent(event="token", data=chunk)
-                    yield f"data: {event.model_dump_json()}\n\n"
-
-                # Emit sources
-                sources_event = ChatStreamEvent(
-                    event="sources",
-                    data={"sources": [s.model_dump() for s in result.sources]},
-                )
-                yield f"data: {sources_event.model_dump_json()}\n\n"
-
-                # Emit done
-                done_event = ChatStreamEvent(
-                    event="done",
-                    data={
-                        "conversation_id": result.conversation_id,
-                        "crag_verdict": result.crag_verdict,
-                        "latency_ms": result.latency_ms,
-                    },
-                )
-                yield f"data: {done_event.model_dump_json()}\n\n"
-
+                ):
+                    yield _format_sse(
+                        evt.get("event", "message"),
+                        evt.get("data"),
+                    )
             except Exception as e:
-                error_event = ChatStreamEvent(event="error", data=str(e))
-                yield f"data: {error_event.model_dump_json()}\n\n"
+                yield _format_sse("error", str(e))
 
         return StreamingResponse(
             event_stream(),

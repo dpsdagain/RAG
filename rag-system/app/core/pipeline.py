@@ -327,6 +327,271 @@ class RAGPipeline:
             )
 
     # ------------------------------------------------------------------
+    # Streaming pipeline
+    # ------------------------------------------------------------------
+
+    async def execute_stream(
+        self,
+        query: str,
+        conversation_id: str | None = None,
+    ) -> AsyncIterator[dict]:
+        """Run the pipeline and yield SSE-shaped event dicts as tokens arrive.
+
+        Mirrors execute() but streams Step 8 generation token-by-token via
+        llm.generate_stream(). Faithfulness, sources, and done events fire
+        after the stream completes.
+        """
+        t0 = time.perf_counter()
+        request_id = str(uuid.uuid4())
+        thread_id = await self.working_memory.get_or_create_thread(conversation_id)
+
+        try:
+            # Step 1: Semantic Cache
+            query_embedding = self._embedder.embed(query)
+            cached = self.cache.lookup(query_embedding)
+
+            if cached is not None:
+                logger.info("pipeline_stream_cache_hit", request_id=request_id)
+                metrics.increment("pipeline_cache_hits")
+                for i in range(0, len(cached.response), 30):
+                    yield {"event": "token", "data": cached.response[i:i + 30]}
+                await self.working_memory.add_turn(thread_id, "user", query)
+                await self.working_memory.add_turn(thread_id, "assistant", cached.response)
+                yield {"event": "sources", "data": {"sources": cached.sources}}
+                yield {"event": "done", "data": {
+                    "conversation_id": thread_id,
+                    "crag_verdict": "CACHED",
+                    "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+                }}
+                return
+
+            # Step 2: Router
+            query_type = self.router.classify(query)
+            logger.info("query_classified", query_type=query_type, request_id=request_id)
+
+            if query_type == "conversational":
+                async for evt in self._stream_conversational(query, thread_id, t0):
+                    yield evt
+                return
+
+            # Step 3: Decomposition
+            sub_queries = [query]
+            if (
+                query_type == "complex_retrieval"
+                and self._settings.pipeline.decomposition_enabled
+            ):
+                sub_queries = await self.decomposer.decompose(query)
+
+            # Step 4: Hybrid retrieval
+            if len(sub_queries) > 1:
+                retrieval_results = await self.search_engine.search_multi_query(
+                    sub_queries,
+                    dense_top_k=self._settings.retrieval.dense_top_k,
+                    sparse_top_k=self._settings.retrieval.sparse_top_k,
+                    rrf_k=self._settings.retrieval.rrf_k,
+                    top_n=self._settings.retrieval.rrf_top_n,
+                )
+            else:
+                retrieval_results = await self.search_engine.search(
+                    query,
+                    dense_top_k=self._settings.retrieval.dense_top_k,
+                    sparse_top_k=self._settings.retrieval.sparse_top_k,
+                    rrf_k=self._settings.retrieval.rrf_k,
+                    top_n=self._settings.retrieval.rrf_top_n,
+                )
+
+            if not retrieval_results:
+                async for evt in self._stream_abstention(query, [], thread_id, t0):
+                    yield evt
+                return
+
+            # Step 5: Rerank
+            reranked = await self.reranker.rerank(
+                query, retrieval_results, top_k=self._settings.retrieval.rerank_top_k
+            )
+
+            # Step 6: Parent context
+            enriched_chunks = await self.parent_injector.inject_parent_context(
+                reranked, budget_tokens=self._settings.retrieval.context_budget_tokens
+            )
+            context_str = self.parent_injector.format_context_for_prompt(enriched_chunks)
+
+            # Step 7: CRAG gate
+            crag_verdict = "SKIPPED"
+            if self._settings.pipeline.crag_enabled:
+                crag_verdict = await self.crag.evaluate(query, reranked)
+                if crag_verdict == "INSUFFICIENT":
+                    rewritten_query, retry_results = await self._retry_with_rewrite(
+                        query, enriched_chunks
+                    )
+                    if retry_results:
+                        reranked = await self.reranker.rerank(
+                            rewritten_query, retry_results,
+                            top_k=self._settings.retrieval.rerank_top_k,
+                        )
+                        enriched_chunks = await self.parent_injector.inject_parent_context(
+                            reranked, budget_tokens=self._settings.retrieval.context_budget_tokens,
+                        )
+                        context_str = self.parent_injector.format_context_for_prompt(enriched_chunks)
+                        crag_verdict = await self.crag.evaluate(rewritten_query, reranked)
+                        if crag_verdict == "INSUFFICIENT":
+                            async for evt in self._stream_abstention(query, reranked, thread_id, t0):
+                                yield evt
+                            return
+
+            # Step 8: STREAM generation
+            working_mem_str = await self.working_memory.format_for_prompt(thread_id)
+            episodic_str = await self.episodic_memory.format_for_prompt(query_embedding)
+            prefs_str = await self.preferences.format_for_prompt()
+            rules_str = await self.rules.format_for_prompt(query)
+
+            messages = generation.build_messages(
+                query=query,
+                retrieved_chunks=context_str,
+                working_memory=working_mem_str,
+                procedural_rules=rules_str,
+                active_preferences=prefs_str,
+                episodic_memory=episodic_str,
+            )
+
+            response_parts: list[str] = []
+            async for token in self._llm.generate_stream(
+                messages,
+                temperature=self._settings.llm.temperature,
+                max_tokens=self._settings.llm.max_tokens,
+            ):
+                response_parts.append(token)
+                yield {"event": "token", "data": token}
+
+            response_text = "".join(response_parts)
+
+            # Step 9: Faithfulness (post-stream)
+            faith_result: dict[str, Any] = {"verified": True, "raw_result": "SKIPPED"}
+            if self._settings.pipeline.faithfulness_check_enabled and response_text:
+                faith_result = await self.faithfulness.check(response_text, enriched_chunks)
+
+            # Step 10: Cache + log + emit sources/done
+            sources = self._build_citations(reranked)
+            self.cache.store(
+                query_embedding=query_embedding,
+                response=response_text,
+                sources=[s.model_dump() for s in sources],
+                conversation_id=thread_id,
+            )
+            await self.working_memory.add_turn(thread_id, "user", query)
+            await self.working_memory.add_turn(thread_id, "assistant", response_text)
+
+            latency_ms = (time.perf_counter() - t0) * 1000
+            metrics.record_latency("pipeline_total_stream", latency_ms)
+            metrics.increment("pipeline_executions")
+
+            try:
+                await self._db.log_request(
+                    request_id=request_id,
+                    query=query,
+                    sub_queries=sub_queries if len(sub_queries) > 1 else None,
+                    crag_verdict=crag_verdict,
+                    faithfulness=faith_result.get("raw_result", ""),
+                    retrieved_chunks=[c.chunk_id for c in reranked],
+                    response_length=len(response_text),
+                    total_latency_ms=int(latency_ms),
+                )
+            except Exception as e:
+                logger.warning("request_log_failed", error=str(e))
+
+            yield {"event": "sources", "data": {
+                "sources": [s.model_dump() for s in sources],
+            }}
+            yield {"event": "done", "data": {
+                "conversation_id": thread_id,
+                "crag_verdict": crag_verdict,
+                "faithfulness": faith_result.get("raw_result"),
+                "latency_ms": round(latency_ms, 1),
+                "query_type": query_type,
+            }}
+
+            logger.info(
+                "pipeline_stream_complete",
+                request_id=request_id,
+                query_type=query_type,
+                crag=crag_verdict,
+                sources=len(sources),
+                latency_ms=round(latency_ms, 1),
+            )
+
+        except Exception as e:
+            latency_ms = (time.perf_counter() - t0) * 1000
+            logger.error(
+                "pipeline_stream_error",
+                request_id=request_id,
+                error=str(e),
+                latency_ms=round(latency_ms, 1),
+            )
+            metrics.increment("pipeline_errors")
+            yield {"event": "error", "data": str(e)}
+
+    async def _stream_conversational(
+        self,
+        query: str,
+        thread_id: str,
+        t0: float,
+    ) -> AsyncIterator[dict]:
+        """Stream a conversational reply (no retrieval)."""
+        working_mem = await self.working_memory.format_for_prompt(thread_id)
+        prefs = await self.preferences.format_for_prompt()
+
+        messages = [
+            {"role": "system", "content": f"You are a helpful assistant.\n{prefs}"},
+            {"role": "user", "content": f"Conversation:\n{working_mem}\n\nUser: {query}"},
+        ]
+
+        parts: list[str] = []
+        async for token in self._llm.generate_stream(messages):
+            parts.append(token)
+            yield {"event": "token", "data": token}
+
+        response = "".join(parts)
+        await self.working_memory.add_turn(thread_id, "user", query)
+        await self.working_memory.add_turn(thread_id, "assistant", response)
+
+        latency_ms = (time.perf_counter() - t0) * 1000
+        yield {"event": "done", "data": {
+            "conversation_id": thread_id,
+            "crag_verdict": "CONVERSATIONAL",
+            "latency_ms": round(latency_ms, 1),
+            "query_type": "conversational",
+        }}
+
+    async def _stream_abstention(
+        self,
+        query: str,
+        chunks: list[ChunkResult],
+        thread_id: str,
+        t0: float,
+    ) -> AsyncIterator[dict]:
+        """Stream an abstention response when context is insufficient."""
+        response = (
+            "I don't have enough relevant information in my knowledge base to "
+            "answer this question accurately. The documents I searched through "
+            "didn't contain sufficient context to provide a reliable answer. "
+            "Please try rephrasing your question or ingesting relevant documents first."
+        )
+        for i in range(0, len(response), 30):
+            yield {"event": "token", "data": response[i:i + 30]}
+
+        await self.working_memory.add_turn(thread_id, "user", query)
+        await self.working_memory.add_turn(thread_id, "assistant", response)
+
+        latency_ms = (time.perf_counter() - t0) * 1000
+        metrics.increment("abstentions")
+        yield {"event": "done", "data": {
+            "conversation_id": thread_id,
+            "crag_verdict": "INSUFFICIENT",
+            "latency_ms": round(latency_ms, 1),
+            "query_type": "abstention",
+        }}
+
+    # ------------------------------------------------------------------
     # Helper methods
     # ------------------------------------------------------------------
 
@@ -420,9 +685,11 @@ class RAGPipeline:
         """Build source citations from reranked chunks."""
         citations: list[SourceCitation] = []
         for chunk in chunks[:10]:  # Limit citations
-            snippet = chunk.content[:300].strip()
-            if len(chunk.content) > 300:
-                snippet += "..."
+            content = chunk.content.strip()
+            if len(content) > 300:
+                snippet = content[:297].rstrip() + "..."
+            else:
+                snippet = content
 
             citations.append(SourceCitation(
                 chunk_id=chunk.chunk_id,
