@@ -72,10 +72,13 @@ class FaithfulnessChecker:
             }
 
         except Exception as e:
+            # Fail CLOSED: a safety gate that errors out must not silently
+            # claim the response is verified. Surface the failure so the
+            # pipeline can warn the user instead of pretending all is well.
             logger.warning("faithfulness_check_failed", error=str(e))
             metrics.increment("faithfulness_errors")
             return {
-                "verified": True,
+                "verified": False,
                 "unsupported_claims": [],
-                "raw_result": "SKIPPED",
+                "raw_result": "ERROR",
             }

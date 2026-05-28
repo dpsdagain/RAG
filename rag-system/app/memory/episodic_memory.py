@@ -107,24 +107,29 @@ class EpisodicMemory:
     async def recall(self, query_embedding: list[float]) -> list[dict]:
         """Recall relevant past conversations by semantic similarity.
 
-        Args:
-            query_embedding: Embedding of the current query.
-
-        Returns:
-            List of dicts with conversation_id, summary, similarity.
+        Same K-NN-as-subquery pattern as Database.vector_search — the vec0
+        virtual table needs to see a bare `MATCH ? LIMIT ?` so it can do
+        the K-NN; joining + filtering in an outer query keeps it happy.
         """
         import struct
         blob = struct.pack(f"{len(query_embedding)}f", *query_embedding)
+        knn_limit = max(self._top_k * 2, self._top_k + 5)
 
         try:
             rows = await self._db.fetch_all(
-                """SELECT cv.conversation_id, cv.distance, c.summary, c.turn_count, c.started_at
-                   FROM conversations_vec cv
+                """SELECT cv.conversation_id, cv.distance, c.summary,
+                          c.turn_count, c.started_at
+                   FROM (
+                       SELECT conversation_id, distance
+                       FROM conversations_vec
+                       WHERE summary_embedding MATCH ?
+                       ORDER BY distance
+                       LIMIT ?
+                   ) cv
                    JOIN conversations c ON c.conversation_id = cv.conversation_id
-                   WHERE cv.summary_embedding MATCH ?
                    ORDER BY cv.distance
                    LIMIT ?""",
-                (blob, self._top_k),
+                (blob, knn_limit, self._top_k),
             )
         except Exception as e:
             logger.warning("episodic_recall_failed", error=str(e))
@@ -132,10 +137,14 @@ class EpisodicMemory:
 
         results: list[dict] = []
         for row in rows:
+            # sqlite-vec L2² distance → [0, 1] similarity (same formula as
+            # Database.vector_search for L2-normalized embeddings).
+            distance = float(row["distance"])
+            similarity = max(0.0, min(1.0, 1.0 - distance / 2.0))
             results.append({
                 "conversation_id": row["conversation_id"],
                 "summary": row["summary"],
-                "similarity": round(1.0 - float(row["distance"]), 4),
+                "similarity": round(similarity, 4),
                 "turn_count": row["turn_count"],
                 "started_at": row["started_at"],
             })

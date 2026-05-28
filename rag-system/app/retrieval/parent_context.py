@@ -92,18 +92,31 @@ class ParentContextInjector:
         )
         return enriched
 
-    @staticmethod
-    def format_context_for_prompt(enriched_chunks: list[dict]) -> str:
+    # Marker tokens used to fence untrusted retrieved content from the LLM.
+    # The system prompt instructs the model to treat anything between these
+    # markers as DATA, never as INSTRUCTIONS — basic prompt-injection defense.
+    OPEN_MARKER = "<<<RETRIEVED_CONTENT>>>"
+    CLOSE_MARKER = "<<<END_RETRIEVED>>>"
+
+    @classmethod
+    def format_context_for_prompt(cls, enriched_chunks: list[dict]) -> str:
         """Format enriched chunks into a string for LLM prompt injection.
+
+        Wraps the entire context in injection-defense markers. Also strips
+        any literal occurrences of the markers from chunk content so a
+        malicious doc cannot break out of the fence.
 
         Args:
             enriched_chunks: Output of inject_parent_context().
 
         Returns:
-            Formatted context string with source metadata and content.
+            Formatted context string fenced with injection-defense markers.
         """
         if not enriched_chunks:
-            return "No relevant context found."
+            return f"{cls.OPEN_MARKER}\nNo relevant context found.\n{cls.CLOSE_MARKER}"
+
+        def _scrub(text: str) -> str:
+            return text.replace(cls.OPEN_MARKER, "").replace(cls.CLOSE_MARKER, "")
 
         parts: list[str] = []
         for i, chunk in enumerate(enriched_chunks, 1):
@@ -119,13 +132,14 @@ class ParentContextInjector:
                 header += f" | Section: {section}"
             header += f" | Chunk: {chunk_id}]"
 
-            content = chunk.get("content", "")
+            content = _scrub(chunk.get("content", ""))
             parent = chunk.get("parent_content")
 
             block = f"{header}\n{content}"
             if parent:
-                block += f"\n[Parent Context:]\n{parent}"
+                block += f"\n[Parent Context:]\n{_scrub(parent)}"
             block += "\n---"
             parts.append(block)
 
-        return "\n\n".join(parts)
+        body = "\n\n".join(parts)
+        return f"{cls.OPEN_MARKER}\n{body}\n{cls.CLOSE_MARKER}"

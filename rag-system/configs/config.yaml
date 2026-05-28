@@ -47,8 +47,12 @@ retrieval:
   rerank_model: "ms-marco-MiniLM-L-12-v2"
 
 # ── Advanced pipeline features ──
+# CRAG is disabled by default — it adds one cloud LLM call per query and
+# largely returns SUFFICIENT in practice. Faithfulness is kept because it
+# actually catches ungrounded claims. Re-enable CRAG if you want stricter
+# retrieval-quality gating at the cost of extra latency + tokens.
 pipeline:
-  crag_enabled: true
+  crag_enabled: false
   decomposition_enabled: true
   faithfulness_check_enabled: true
 
@@ -58,9 +62,12 @@ memory:
   episodic_memory_top_k: 3
 
 # ── Semantic cache ──
+# Threshold lowered from 0.95 → 0.85: at 0.95 the real-world hit rate was
+# effectively 0% because near-paraphrases of the same question rarely
+# cosine-match that closely. 0.85 still requires strong semantic overlap.
 cache:
   max_entries: 500
-  similarity_threshold: 0.95
+  similarity_threshold: 0.85
   ttl_seconds: 3600
 
 # ── Chunking strategy ──

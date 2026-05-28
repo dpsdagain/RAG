@@ -38,11 +38,28 @@ def quality_pipeline(ingested_corpus_db, real_embedder, real_llm_client):
     )
 
 
+def _normalize_for_match(text: str) -> str:
+    """Normalize LLM output for substring matching.
+
+    Real LLMs love to emit Unicode punctuation — non-breaking hyphens
+    (U+2011), narrow no-break space (U+202F), em-dashes, smart quotes —
+    that defeat naive substring tests. Map them to ASCII first.
+    """
+    replacements = {
+        "‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-",
+        " ": " ", " ": " ", " ": " ",
+        "“": '"', "”": '"', "‘": "'", "’": "'",
+    }
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
+    return text.lower()
+
+
 @pytest.mark.parametrize("case", GOLDEN_SET, ids=[c["id"] for c in GOLDEN_SET])
 async def test_answer_mentions_expected_facts(case, quality_pipeline):
     """The generated answer should reference at least one expected fact."""
     result = await quality_pipeline.execute(case["query"])
-    answer = result.response.lower()
+    answer = _normalize_for_match(result.response)
 
     matched = [sub for sub in case["must_generate"] if sub in answer]
     assert matched, (
@@ -73,8 +90,8 @@ async def test_cache_returns_same_response_on_repeat(quality_pipeline):
     assert second.response == first.response
 
 
-async def test_streaming_yields_tokens_in_order(quality_pipeline):
-    """execute_stream must emit token events before sources, then done."""
+async def test_streaming_yields_sources_then_tokens_then_done(quality_pipeline):
+    """execute_stream must emit sources first, then tokens, then done."""
     events: list[dict] = []
     async for evt in quality_pipeline.execute_stream("How does hybrid search work?"):
         events.append(evt)
@@ -82,11 +99,10 @@ async def test_streaming_yields_tokens_in_order(quality_pipeline):
     event_names = [e["event"] for e in events]
     assert "token" in event_names
     assert "done" in event_names
-    # All tokens must come before sources, sources before done.
-    last_token_idx = max(i for i, e in enumerate(event_names) if e == "token")
     done_idx = event_names.index("done")
+    first_token_idx = event_names.index("token")
     if "sources" in event_names:
         sources_idx = event_names.index("sources")
-        assert last_token_idx < sources_idx < done_idx
-    else:
-        assert last_token_idx < done_idx
+        # Sources must be the first non-trivial event, before any token.
+        assert sources_idx < first_token_idx
+    assert first_token_idx < done_idx

@@ -177,7 +177,8 @@ class TestPipelineExecute:
 # ---------------------------------------------------------------------------
 
 class TestPipelineStream:
-    async def test_emits_token_then_sources_then_done(self, temp_db, fake_embedder):
+    async def test_emits_sources_then_tokens_then_done(self, temp_db, fake_embedder):
+        """Sources must arrive BEFORE tokens so UI can render inline citations."""
         await _seed_corpus(temp_db, fake_embedder)
         llm = FakeLLMClient(canned_response="alpha beta gamma")
         pipeline = await _make_pipeline(temp_db, fake_embedder, llm)
@@ -187,12 +188,12 @@ class TestPipelineStream:
             events.append(evt)
 
         event_names = [e["event"] for e in events]
-        # Tokens must come before sources, which must come before done.
-        assert "token" in event_names
         assert "sources" in event_names
+        assert "token" in event_names
         assert "done" in event_names
-        assert event_names.index("token") < event_names.index("sources")
-        assert event_names.index("sources") < event_names.index("done")
+        # Sources first, then tokens, then done.
+        assert event_names.index("sources") < event_names.index("token")
+        assert event_names.index("token") < event_names.index("done")
 
     async def test_token_events_concatenate_to_response(self, temp_db, fake_embedder):
         await _seed_corpus(temp_db, fake_embedder)

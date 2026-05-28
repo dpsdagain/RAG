@@ -82,7 +82,33 @@ class RAGPipeline:
         self.decomposer = QueryDecomposer(llm)
         self.faithfulness = FaithfulnessChecker(llm)
 
+        # Episodic memory is summarised + stored every N assistant turns.
+        self._episodic_store_every = 5
+
         logger.info("rag_pipeline_initialized")
+
+    async def _maybe_store_episodic(self, thread_id: str) -> None:
+        """If enough new turns have accumulated, summarise and persist.
+
+        Counts the assistant turns in working memory; when divisible by
+        ``self._episodic_store_every`` (5), build a turn list and call
+        EpisodicMemory.store_conversation. Uses INSERT OR REPLACE so the
+        summary is refreshed as the conversation grows.
+        """
+        try:
+            turns = await self.working_memory.get_turns(thread_id)
+            assistant_turns = sum(1 for t in turns if t.role == "assistant")
+            if assistant_turns == 0 or assistant_turns % self._episodic_store_every != 0:
+                return
+
+            payload = [
+                {"role": t.role, "content": t.content}
+                for t in turns
+            ]
+            await self.episodic_memory.store_conversation(thread_id, payload)
+        except Exception as e:
+            # Never let episodic-store failures break a live request.
+            logger.warning("episodic_store_failed", error=str(e))
 
     async def execute(
         self,
@@ -251,6 +277,12 @@ class RAGPipeline:
             if self._settings.pipeline.faithfulness_check_enabled:
                 faith_result = await self.faithfulness.check(response_text, enriched_chunks)
 
+            # Append a user-visible warning if the gate flagged anything.
+            if not faith_result.get("verified", True):
+                warning = self._build_faithfulness_warning(faith_result)
+                if warning:
+                    response_text = f"{response_text}\n\n{warning}"
+
             # ============================================================
             # Step 10: Cache + Log + Return
             # ============================================================
@@ -268,6 +300,7 @@ class RAGPipeline:
             # Store conversation turns
             await self.working_memory.add_turn(thread_id, "user", query)
             await self.working_memory.add_turn(thread_id, "assistant", response_text)
+            await self._maybe_store_episodic(thread_id)
 
             # Log request
             latency_ms = (time.perf_counter() - t0) * 1000
@@ -353,11 +386,12 @@ class RAGPipeline:
             if cached is not None:
                 logger.info("pipeline_stream_cache_hit", request_id=request_id)
                 metrics.increment("pipeline_cache_hits")
+                # Sources first so the UI can render citations alongside tokens.
+                yield {"event": "sources", "data": {"sources": cached.sources}}
                 for i in range(0, len(cached.response), 30):
                     yield {"event": "token", "data": cached.response[i:i + 30]}
                 await self.working_memory.add_turn(thread_id, "user", query)
                 await self.working_memory.add_turn(thread_id, "assistant", cached.response)
-                yield {"event": "sources", "data": {"sources": cached.sources}}
                 yield {"event": "done", "data": {
                     "conversation_id": thread_id,
                     "crag_verdict": "CACHED",
@@ -454,6 +488,13 @@ class RAGPipeline:
                 episodic_memory=episodic_str,
             )
 
+            # Emit sources BEFORE the token stream so the UI can render
+            # citations as the answer types out, not after.
+            preview_sources = self._build_citations(reranked)
+            yield {"event": "sources", "data": {
+                "sources": [s.model_dump() for s in preview_sources],
+            }}
+
             response_parts: list[str] = []
             async for token in self._llm.generate_stream(
                 messages,
@@ -470,8 +511,16 @@ class RAGPipeline:
             if self._settings.pipeline.faithfulness_check_enabled and response_text:
                 faith_result = await self.faithfulness.check(response_text, enriched_chunks)
 
-            # Step 10: Cache + log + emit sources/done
-            sources = self._build_citations(reranked)
+            # Stream a trailing warning if the gate flagged issues. The
+            # tokens are already sent — this is the best we can do without
+            # buffering the full response before delivery.
+            if not faith_result.get("verified", True):
+                warning = self._build_faithfulness_warning(faith_result)
+                if warning:
+                    yield {"event": "token", "data": f"\n\n{warning}"}
+
+            # Step 10: Cache + log + done (sources were emitted pre-stream)
+            sources = preview_sources
             self.cache.store(
                 query_embedding=query_embedding,
                 response=response_text,
@@ -480,6 +529,7 @@ class RAGPipeline:
             )
             await self.working_memory.add_turn(thread_id, "user", query)
             await self.working_memory.add_turn(thread_id, "assistant", response_text)
+            await self._maybe_store_episodic(thread_id)
 
             latency_ms = (time.perf_counter() - t0) * 1000
             metrics.record_latency("pipeline_total_stream", latency_ms)
@@ -499,9 +549,7 @@ class RAGPipeline:
             except Exception as e:
                 logger.warning("request_log_failed", error=str(e))
 
-            yield {"event": "sources", "data": {
-                "sources": [s.model_dump() for s in sources],
-            }}
+            # Sources were already streamed BEFORE the tokens. Just emit done.
             yield {"event": "done", "data": {
                 "conversation_id": thread_id,
                 "crag_verdict": crag_verdict,
@@ -553,6 +601,7 @@ class RAGPipeline:
         response = "".join(parts)
         await self.working_memory.add_turn(thread_id, "user", query)
         await self.working_memory.add_turn(thread_id, "assistant", response)
+        await self._maybe_store_episodic(thread_id)
 
         latency_ms = (time.perf_counter() - t0) * 1000
         yield {"event": "done", "data": {
@@ -679,6 +728,24 @@ class RAGPipeline:
             latency_ms=round(latency_ms, 1),
             query_type="abstention",
         )
+
+    @staticmethod
+    def _build_faithfulness_warning(faith_result: dict) -> str:
+        """Render a short user-visible warning when faithfulness flags the answer."""
+        verdict = faith_result.get("raw_result", "")
+        if verdict == "ERROR":
+            return (
+                "⚠️ The faithfulness check did not complete — this answer is "
+                "**unverified** against the source documents."
+            )
+        unsupported = faith_result.get("unsupported_claims") or []
+        if unsupported:
+            claims = "\n".join(f"- {c}" for c in unsupported[:3])
+            return (
+                "⚠️ Some claims in this answer were not directly supported by "
+                f"the retrieved sources:\n{claims}"
+            )
+        return ""
 
     @staticmethod
     def _build_citations(chunks: list[ChunkResult]) -> list[SourceCitation]:

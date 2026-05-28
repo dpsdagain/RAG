@@ -94,47 +94,44 @@ class IngestionRouter:
             )
 
     async def _parse_pdf(self, file_path: Path) -> ParsedDocument:
-        """Multi-tier PDF parsing with quality-based fallback."""
-        # Tier 1: Local parser (pymupdf4llm)
-        try:
-            from app.ingestion.parsers.pdf_local import PDFLocalParser
-            parser = PDFLocalParser()
-            result = await parser.parse(file_path)
-            quality = result.metadata.get("quality_score", 1.0)
+        """Two-tier PDF parsing with quality-based fallback.
 
+        Tier 1: pymupdf4llm (local, fast, text-extractable PDFs).
+        Tier 2: LlamaParse cloud (scanned / complex PDFs).
+        The previous Docling middle tier was removed — its install is
+        heavyweight, CPU runs are ~10 s/page, and the dep was commented
+        out of requirements anyway.
+        """
+        from app.ingestion.parsers.pdf_local import PDFLocalParser
+
+        tier1_result: ParsedDocument | None = None
+
+        # Tier 1
+        try:
+            tier1_result = await PDFLocalParser().parse(file_path)
+            quality = tier1_result.metadata.get("quality_score", 1.0)
             if quality >= 0.5:
                 logger.info("pdf_parsed_tier1", quality=quality)
-                return result
-
-            logger.info("pdf_low_quality_tier1", quality=quality, msg="Trying Docling")
+                return tier1_result
+            logger.info("pdf_low_quality_tier1", quality=quality, msg="Trying cloud parse")
         except Exception as e:
             logger.warning("pdf_tier1_failed", error=str(e))
 
-        # Tier 2: Docling
+        # Tier 2: Cloud (LlamaParse)
         try:
-            from app.ingestion.parsers.pdf_docling import PDFDoclingParser
-            parser2 = PDFDoclingParser()
-            result = await parser2.parse(file_path)
-            logger.info("pdf_parsed_tier2")
+            from app.ingestion.parsers.pdf_cloud import PDFCloudParser
+            result = await PDFCloudParser().parse(file_path)
+            logger.info("pdf_parsed_tier2_cloud")
             return result
-        except ImportError:
-            logger.info("docling_not_installed", msg="Skipping tier 2")
         except Exception as e:
             logger.warning("pdf_tier2_failed", error=str(e))
 
-        # Tier 3: Cloud (LlamaParse)
-        try:
-            from app.ingestion.parsers.pdf_cloud import PDFCloudParser
-            parser3 = PDFCloudParser()
-            result = await parser3.parse(file_path)
-            logger.info("pdf_parsed_tier3")
-            return result
-        except Exception as e:
-            logger.warning("pdf_tier3_failed", error=str(e))
-
-        # Final fallback: return tier 1 result if we got one
-        from app.ingestion.parsers.pdf_local import PDFLocalParser
-        return await PDFLocalParser().parse(file_path)
+        # Neither tier produced a clean result. Return the tier-1 attempt
+        # if we got one, else re-raise to surface the failure.
+        if tier1_result is not None:
+            logger.warning("pdf_returning_low_quality_tier1")
+            return tier1_result
+        raise RuntimeError(f"All PDF parsers failed for {file_path}")
 
     async def _parse_code(self, file_path: Path) -> ParsedDocument:
         """Parse source code files."""

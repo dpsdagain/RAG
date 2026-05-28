@@ -7,6 +7,7 @@ and token budget constraints.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import uuid
 from typing import Any
@@ -15,6 +16,11 @@ import numpy as np
 
 from app.infrastructure.database import ChunkRecord
 from app.infrastructure.observability import get_logger, metrics
+from app.ingestion.chunking.adaptive_metrics import (
+    compute_dcc,
+    compute_icc,
+    evaluate_chunk_quality,
+)
 from app.ingestion.parsers.base import ParsedDocument
 from app.models.embedder import Embedder
 
@@ -93,9 +99,16 @@ class SemanticChunker:
         # Step 7: Post-process (merge small, split large)
         processed = self._post_process(raw_chunks)
 
-        # Step 8: Build ChunkRecords with embeddings
+        # Compute a document-level embedding — the L2-normalized mean of
+        # all sentence embeddings. Used by DCC to score each chunk's
+        # contextual coherence against the document as a whole.
+        doc_embedding = self._compute_doc_embedding(sentence_embeddings)
+
+        # Step 8: Build ChunkRecords with embeddings + ICC/DCC metrics
         chunk_records = self._build_records(
-            processed, doc_id, parsed_doc
+            processed, doc_id, parsed_doc,
+            sentence_embeddings=sentence_embeddings,
+            doc_embedding=doc_embedding,
         )
 
         metrics.record_latency("chunking_count", len(chunk_records))
@@ -107,6 +120,22 @@ class SemanticChunker:
         )
 
         return chunk_records
+
+    @staticmethod
+    def _compute_doc_embedding(sentence_embeddings: list[list[float]]) -> list[float]:
+        """Mean of sentence embeddings, L2-renormalized.
+
+        Cheap proxy for the document's overall theme without doing a
+        second pass through the embedder on the whole-document text.
+        """
+        if not sentence_embeddings:
+            return []
+        arr = np.array(sentence_embeddings, dtype=np.float32)
+        mean_vec = arr.mean(axis=0)
+        norm = float(np.linalg.norm(mean_vec))
+        if norm < 1e-12:
+            return mean_vec.tolist()
+        return (mean_vec / norm).tolist()
 
     def _extract_special_blocks(self, text: str) -> tuple[list[dict], str]:
         """Extract tables and code blocks, replacing them with markers."""
@@ -230,7 +259,13 @@ class SemanticChunker:
         sentences: list[dict],
         split_points: list[int],
     ) -> list[dict]:
-        """Group sentences into chunks based on split points."""
+        """Group sentences into chunks based on split points.
+
+        Each returned dict includes ``sentence_indices`` — the original
+        positions of its source sentences in the input list. Downstream
+        steps use this to look up the sentence embeddings needed for
+        ICC computation per chunk.
+        """
         chunks: list[dict] = []
         prev = 0
 
@@ -254,13 +289,22 @@ class SemanticChunker:
                     "section_title": section,
                     "source_page": page,
                     "is_special": False,
+                    "sentence_indices": list(range(prev, sp)),
                 })
             prev = sp
 
         return chunks
 
     def _post_process(self, chunks: list[dict]) -> list[dict]:
-        """Merge small chunks and hard-split oversized ones."""
+        """Merge small chunks and hard-split oversized ones.
+
+        Preserves ``sentence_indices`` so downstream ICC computation can
+        still slice the right sentence embeddings:
+        - Merged chunks: union of both source-chunk index lists.
+        - Hard-split chunks: each split inherits the parent's full index
+          list (they share the same source sentences; ICC will be 1.0 by
+          definition for word-bounded splits, which is acceptable).
+        """
         if not chunks:
             return []
 
@@ -272,8 +316,13 @@ class SemanticChunker:
                 # Merge with previous chunk
                 prev = processed[-1]
                 prev["text"] = prev["text"] + "\n\n" + chunk["text"]
+                prev["sentence_indices"] = (
+                    prev.get("sentence_indices", []) + chunk.get("sentence_indices", [])
+                )
             elif tokens > self._max_tokens * 1.5:
-                # Hard split at sentence boundaries
+                # Hard split at word boundaries — all splits inherit the
+                # parent chunk's sentence indices.
+                indices = chunk.get("sentence_indices", [])
                 words = chunk["text"].split()
                 current: list[str] = []
                 current_tokens = 0
@@ -287,6 +336,7 @@ class SemanticChunker:
                             "section_title": chunk.get("section_title"),
                             "source_page": chunk.get("source_page"),
                             "is_special": False,
+                            "sentence_indices": indices,
                         })
                         current = []
                         current_tokens = 0
@@ -297,6 +347,7 @@ class SemanticChunker:
                         "section_title": chunk.get("section_title"),
                         "source_page": chunk.get("source_page"),
                         "is_special": False,
+                        "sentence_indices": indices,
                     })
             else:
                 processed.append(chunk)
@@ -308,8 +359,18 @@ class SemanticChunker:
         chunks: list[dict],
         doc_id: str,
         parsed_doc: ParsedDocument,
+        sentence_embeddings: list[list[float]] | None = None,
+        doc_embedding: list[float] | None = None,
     ) -> list[ChunkRecord]:
-        """Build ChunkRecord objects with embeddings."""
+        """Build ChunkRecord objects with embeddings and quality metrics.
+
+        For each chunk we compute:
+        - ICC (Intrachunk Cohesion) from the sentence embeddings whose
+          indices were recorded for the chunk during grouping.
+        - DCC (Document Contextual Coherence) from the chunk's own
+          embedding versus the document-level mean embedding.
+        Both are stored in ``metadata_json`` along with a quality label.
+        """
         if not chunks:
             return []
 
@@ -317,9 +378,14 @@ class SemanticChunker:
         texts = [c["text"] for c in chunks]
         embeddings = self._embedder.embed_batch(texts)
 
+        sentence_embeddings = sentence_embeddings or []
+        n_sentences = len(sentence_embeddings)
+        has_doc_emb = bool(doc_embedding)
+
         # Build parent chunk map (section → parent_id)
         section_parents: dict[str, str] = {}
 
+        poor_quality_count = 0
         records: list[ChunkRecord] = []
         for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
             chunk_id = str(uuid.uuid4())
@@ -334,6 +400,33 @@ class SemanticChunker:
             elif section:
                 section_parents[section] = chunk_id
 
+            # --- Quality metrics ---
+            # ICC: pull the source-sentence embeddings for this chunk if we
+            # have them. Special blocks (tables, code) get ICC=1.0 since
+            # they are atomic by design — there's only one "unit" inside.
+            indices = chunk.get("sentence_indices") or []
+            valid = [j for j in indices if 0 <= j < n_sentences]
+            if chunk.get("is_special") or not valid:
+                icc_score = 1.0
+            else:
+                icc_score = compute_icc([sentence_embeddings[j] for j in valid])
+
+            # DCC: cosine between this chunk's embedding and the doc mean.
+            dcc_score = compute_dcc(embedding, doc_embedding) if has_doc_emb else 1.0
+
+            quality = evaluate_chunk_quality(icc_score, dcc_score)
+            if quality == "poor":
+                poor_quality_count += 1
+
+            existing_meta: dict[str, Any] = {}
+            metadata_json = json.dumps({
+                **existing_meta,
+                "icc": round(icc_score, 4),
+                "dcc": round(dcc_score, 4),
+                "quality": quality,
+                "is_special": bool(chunk.get("is_special")),
+            })
+
             records.append(ChunkRecord(
                 chunk_id=chunk_id,
                 doc_id=doc_id,
@@ -345,6 +438,16 @@ class SemanticChunker:
                 source_page=chunk.get("source_page"),
                 token_count=token_count,
                 content_hash=content_hash,
+                metadata_json=metadata_json,
             ))
+
+        if poor_quality_count:
+            logger.warning(
+                "chunks_with_low_quality",
+                doc_id=doc_id,
+                poor=poor_quality_count,
+                total=len(records),
+                msg="Chunks flagged ICC<0.2 — consider re-ingesting with different settings",
+            )
 
         return records

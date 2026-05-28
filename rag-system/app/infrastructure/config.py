@@ -66,7 +66,9 @@ class RetrievalConfig(BaseModel):
 
 class PipelineConfig(BaseModel):
     """RAG pipeline feature toggles."""
-    crag_enabled: bool = Field(default=True, description="Enable CRAG quality gate")
+    # CRAG defaults OFF — costs a cloud LLM call per query and usually returns
+    # SUFFICIENT anyway. Faithfulness is the higher-value safety gate.
+    crag_enabled: bool = Field(default=False, description="Enable CRAG quality gate")
     decomposition_enabled: bool = Field(default=True, description="Enable query decomposition")
     faithfulness_check_enabled: bool = Field(default=True, description="Enable post-gen faithfulness check")
 
@@ -80,7 +82,8 @@ class MemoryConfig(BaseModel):
 class CacheConfig(BaseModel):
     """Semantic cache settings."""
     max_entries: int = Field(default=500, description="Max cache entries")
-    similarity_threshold: float = Field(default=0.95, description="Min cosine similarity for cache hit")
+    # Lowered from 0.95 — see configs/config.yaml for the why.
+    similarity_threshold: float = Field(default=0.85, description="Min cosine similarity for cache hit")
     ttl_seconds: int = Field(default=3600, description="Cache entry TTL in seconds")
 
 

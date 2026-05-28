@@ -39,55 +39,67 @@ async def on_message(message: cl.Message):
         "stream": True
     }
     
-    sources = []
-    
+    sources: list[dict] = []
+    sources_rendered = False
+
+    async def _render_sources_now() -> None:
+        """Attach the side-panel citations as soon as we have them."""
+        nonlocal sources_rendered
+        if sources_rendered or not sources:
+            return
+        elements = []
+        for i, source in enumerate(sources):
+            content = f"**Score:** {source.get('score', 0):.2f}\n\n{source.get('content_snippet', '')}"
+            name = f"[{i+1}] {source.get('source_uri', 'Unknown').split('/')[-1]}"
+            elements.append(cl.Text(name=name, content=content, display="side"))
+        msg.elements = elements
+        await msg.update()
+        sources_rendered = True
+
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
             async with httpx_sse.aconnect_sse(
-                client, 
-                "POST", 
+                client,
+                "POST",
                 f"{API_BASE_URL}/chat/completions",
                 json=request_payload
             ) as event_source:
                 async for sse in event_source.aiter_sse():
                     data = json.loads(sse.data)
-                    
-                    if sse.event == "token":
-                        # Stream text chunks
+
+                    if sse.event == "sources":
+                        # Render the side panel BEFORE tokens stream so
+                        # citations are visible alongside the answer.
+                        sources = list(data.get("sources", []))
+                        await _render_sources_now()
+
+                    elif sse.event == "token":
                         await msg.stream_token(data)
-                        
-                    elif sse.event == "sources":
-                        # Collect sources
-                        sources.extend(data.get("sources", []))
-                        
+
                     elif sse.event == "done":
-                        # Save conversation ID for continuity
                         new_conv_id = data.get("conversation_id")
                         if new_conv_id:
                             cl.user_session.set("conversation_id", new_conv_id)
-                            
+
                     elif sse.event == "error":
                         msg.content = f"❌ Error: {data}"
                         await msg.update()
-                        break
-                        
+                        return
+
     except Exception as e:
         msg.content = f"❌ Connection to backend failed: {str(e)}"
         await msg.update()
         return
 
-    # 3. Format and attach sources if available
+    # Fallback: if sources arrived after tokens (cached/older paths) ensure
+    # they still get rendered before the final update.
+    await _render_sources_now()
+
     if sources:
-        source_elements = []
-        for i, source in enumerate(sources):
-            # Create a markdown element for each source citation
-            content = f"**Score:** {source.get('score', 0):.2f}\n\n{source.get('content_snippet', '')}"
-            name = f"[{i+1}] {source.get('source_uri', 'Unknown').split('/')[-1]}"
-            source_elements.append(cl.Text(name=name, content=content, display="side"))
-        
-        msg.elements = source_elements
-        # Append reference links at the bottom of the message
-        refs = ", ".join([f"{el.name}" for el in source_elements])
+        refs = ", ".join(
+            f"[{i+1}] {s.get('source_uri', 'Unknown').split('/')[-1]}"
+            for i, s in enumerate(sources)
+        )
         await msg.stream_token(f"\n\n**Sources:** {refs}")
 
     await msg.update()

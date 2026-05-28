@@ -32,10 +32,27 @@ logger = get_logger("main")
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
+_DEFAULT_API_KEY = "change-me-in-production"
+_LOCALHOST_BINDS = {"127.0.0.1", "localhost", "::1"}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Application lifespan: startup and shutdown."""
     settings = get_settings()
+
+    # Default-deny: refuse to start with the placeholder API key on any
+    # non-loopback bind. Localhost-only is allowed for dev convenience.
+    if (
+        settings.server.api_key == _DEFAULT_API_KEY
+        and settings.server.host not in _LOCALHOST_BINDS
+    ):
+        raise RuntimeError(
+            "Refusing to start: server.api_key is still the placeholder "
+            f"'{_DEFAULT_API_KEY}' while binding to {settings.server.host!r}. "
+            "Set RAG_SERVER__API_KEY in .env to a real secret, or bind to "
+            "127.0.0.1 for local-only development."
+        )
 
     # ----- STARTUP -----
     logger.info("app_starting", host=settings.server.host, port=settings.server.port)
