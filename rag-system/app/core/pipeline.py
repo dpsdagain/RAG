@@ -12,9 +12,11 @@ import uuid
 from typing import Any, AsyncIterator
 
 from app.api.schemas import ChatResponse, ChatStreamEvent, SourceCitation
+from app.core.agentic_loop import AgenticRetriever
 from app.core.crag_gate import CRAGGate
 from app.core.faithfulness_checker import FaithfulnessChecker
 from app.core.prompt_templates import generation, query_rewrite
+from app.core.prompt_templates.generation import format_corpus_manifest
 from app.core.query_decomposer import QueryDecomposer
 from app.core.query_router import QueryRouter
 from app.infrastructure.config import Settings
@@ -64,7 +66,12 @@ class RAGPipeline:
 
         # Initialize all sub-components
         self.search_engine = HybridSearchEngine(db, embedder)
-        self.reranker = Reranker(settings.retrieval.rerank_model)
+        # Reranker shares the Voyage key with the embedder (used only when
+        # rerank_model is a 'rerank-*' Voyage model; ignored for local backends).
+        self.reranker = Reranker(
+            settings.retrieval.rerank_model,
+            api_key=settings.embedding.api_key,
+        )
         self.parent_injector = ParentContextInjector(db, embedder)
         self.cache = SemanticCache(
             max_entries=settings.cache.max_entries,
@@ -81,6 +88,13 @@ class RAGPipeline:
         self.crag = CRAGGate(llm)
         self.decomposer = QueryDecomposer(llm)
         self.faithfulness = FaithfulnessChecker(llm)
+        self.agentic = AgenticRetriever(
+            db=db,
+            embedder=embedder,
+            search_engine=self.search_engine,
+            llm=llm,
+            settings=settings,
+        )
 
         # Episodic memory is summarised + stored every N assistant turns.
         self._episodic_store_every = 5
@@ -136,7 +150,7 @@ class RAGPipeline:
             # ============================================================
             # Step 1: Semantic Cache Check
             # ============================================================
-            query_embedding = self._embedder.embed(query)
+            query_embedding = self._embedder.embed(query, input_type="query")
             cached = self.cache.lookup(query_embedding)
 
             if cached is not None:
@@ -167,35 +181,39 @@ class RAGPipeline:
                 return await self._handle_conversational(query, thread_id, t0)
 
             # ============================================================
-            # Step 3: Query Decomposition (if complex)
+            # Steps 3-4: Evidence gathering
+            # Agentic loop (iterative search/read) when enabled, otherwise
+            # the one-shot decompose + hybrid-retrieve path.
             # ============================================================
             sub_queries = [query]
-            if (
-                query_type == "complex_retrieval"
-                and self._settings.pipeline.decomposition_enabled
-            ):
-                sub_queries = await self.decomposer.decompose(query)
-                logger.info("query_decomposed", sub_queries=len(sub_queries))
-
-            # ============================================================
-            # Step 4: Hybrid Retrieval
-            # ============================================================
-            if len(sub_queries) > 1:
-                retrieval_results = await self.search_engine.search_multi_query(
-                    sub_queries,
-                    dense_top_k=self._settings.retrieval.dense_top_k,
-                    sparse_top_k=self._settings.retrieval.sparse_top_k,
-                    rrf_k=self._settings.retrieval.rrf_k,
-                    top_n=self._settings.retrieval.rrf_top_n,
-                )
+            if self._settings.pipeline.agentic_enabled:
+                retrieval_results = await self.agentic.gather(query)
             else:
-                retrieval_results = await self.search_engine.search(
-                    query,
-                    dense_top_k=self._settings.retrieval.dense_top_k,
-                    sparse_top_k=self._settings.retrieval.sparse_top_k,
-                    rrf_k=self._settings.retrieval.rrf_k,
-                    top_n=self._settings.retrieval.rrf_top_n,
-                )
+                # Step 3: Query Decomposition (if complex)
+                if (
+                    query_type == "complex_retrieval"
+                    and self._settings.pipeline.decomposition_enabled
+                ):
+                    sub_queries = await self.decomposer.decompose(query)
+                    logger.info("query_decomposed", sub_queries=len(sub_queries))
+
+                # Step 4: Hybrid Retrieval
+                if len(sub_queries) > 1:
+                    retrieval_results = await self.search_engine.search_multi_query(
+                        sub_queries,
+                        dense_top_k=self._settings.retrieval.dense_top_k,
+                        sparse_top_k=self._settings.retrieval.sparse_top_k,
+                        rrf_k=self._settings.retrieval.rrf_k,
+                        top_n=self._settings.retrieval.rrf_top_n,
+                    )
+                else:
+                    retrieval_results = await self.search_engine.search(
+                        query,
+                        dense_top_k=self._settings.retrieval.dense_top_k,
+                        sparse_top_k=self._settings.retrieval.sparse_top_k,
+                        rrf_k=self._settings.retrieval.rrf_k,
+                        top_n=self._settings.retrieval.rrf_top_n,
+                    )
 
             logger.info("retrieval_complete", results=len(retrieval_results))
 
@@ -254,6 +272,9 @@ class RAGPipeline:
             episodic_str = await self.episodic_memory.format_for_prompt(query_embedding)
             prefs_str = await self.preferences.format_for_prompt()
             rules_str = await self.rules.format_for_prompt(query)
+            manifest_str = format_corpus_manifest(
+                await self._db.get_active_document_manifest()
+            )
 
             messages = generation.build_messages(
                 query=query,
@@ -262,6 +283,7 @@ class RAGPipeline:
                 procedural_rules=rules_str,
                 active_preferences=prefs_str,
                 episodic_memory=episodic_str,
+                ingested_corpus=manifest_str,
             )
 
             response_text = await self._llm.generate(
@@ -380,7 +402,7 @@ class RAGPipeline:
 
         try:
             # Step 1: Semantic Cache
-            query_embedding = self._embedder.embed(query)
+            query_embedding = self._embedder.embed(query, input_type="query")
             cached = self.cache.lookup(query_embedding)
 
             if cached is not None:
@@ -408,31 +430,42 @@ class RAGPipeline:
                     yield evt
                 return
 
-            # Step 3: Decomposition
+            # Steps 3-4: Evidence gathering — agentic loop or one-shot.
             sub_queries = [query]
-            if (
-                query_type == "complex_retrieval"
-                and self._settings.pipeline.decomposition_enabled
-            ):
-                sub_queries = await self.decomposer.decompose(query)
-
-            # Step 4: Hybrid retrieval
-            if len(sub_queries) > 1:
-                retrieval_results = await self.search_engine.search_multi_query(
-                    sub_queries,
-                    dense_top_k=self._settings.retrieval.dense_top_k,
-                    sparse_top_k=self._settings.retrieval.sparse_top_k,
-                    rrf_k=self._settings.retrieval.rrf_k,
-                    top_n=self._settings.retrieval.rrf_top_n,
-                )
+            if self._settings.pipeline.agentic_enabled:
+                retrieval_results = []
+                async for ev in self.agentic.run(query):
+                    if ev["type"] == "status":
+                        # Surfaced as a named SSE event the UI may show or
+                        # ignore — current frontend ignores unknown events.
+                        yield {"event": "status", "data": ev["msg"]}
+                    elif ev["type"] == "result":
+                        retrieval_results = ev["chunks"]
             else:
-                retrieval_results = await self.search_engine.search(
-                    query,
-                    dense_top_k=self._settings.retrieval.dense_top_k,
-                    sparse_top_k=self._settings.retrieval.sparse_top_k,
-                    rrf_k=self._settings.retrieval.rrf_k,
-                    top_n=self._settings.retrieval.rrf_top_n,
-                )
+                # Step 3: Decomposition
+                if (
+                    query_type == "complex_retrieval"
+                    and self._settings.pipeline.decomposition_enabled
+                ):
+                    sub_queries = await self.decomposer.decompose(query)
+
+                # Step 4: Hybrid retrieval
+                if len(sub_queries) > 1:
+                    retrieval_results = await self.search_engine.search_multi_query(
+                        sub_queries,
+                        dense_top_k=self._settings.retrieval.dense_top_k,
+                        sparse_top_k=self._settings.retrieval.sparse_top_k,
+                        rrf_k=self._settings.retrieval.rrf_k,
+                        top_n=self._settings.retrieval.rrf_top_n,
+                    )
+                else:
+                    retrieval_results = await self.search_engine.search(
+                        query,
+                        dense_top_k=self._settings.retrieval.dense_top_k,
+                        sparse_top_k=self._settings.retrieval.sparse_top_k,
+                        rrf_k=self._settings.retrieval.rrf_k,
+                        top_n=self._settings.retrieval.rrf_top_n,
+                    )
 
             if not retrieval_results:
                 async for evt in self._stream_abstention(query, [], thread_id, t0):
@@ -478,6 +511,9 @@ class RAGPipeline:
             episodic_str = await self.episodic_memory.format_for_prompt(query_embedding)
             prefs_str = await self.preferences.format_for_prompt()
             rules_str = await self.rules.format_for_prompt(query)
+            manifest_str = format_corpus_manifest(
+                await self._db.get_active_document_manifest()
+            )
 
             messages = generation.build_messages(
                 query=query,
@@ -486,6 +522,7 @@ class RAGPipeline:
                 procedural_rules=rules_str,
                 active_preferences=prefs_str,
                 episodic_memory=episodic_str,
+                ingested_corpus=manifest_str,
             )
 
             # Emit sources BEFORE the token stream so the UI can render
@@ -731,19 +768,32 @@ class RAGPipeline:
 
     @staticmethod
     def _build_faithfulness_warning(faith_result: dict) -> str:
-        """Render a short user-visible warning when faithfulness flags the answer."""
+        """Render a short user-visible warning when faithfulness flags the answer.
+
+        Now surfaces the RAGAS-style score (0-1) so the user sees HOW
+        grounded the answer is, not just whether anything was flagged.
+        """
         verdict = faith_result.get("raw_result", "")
         if verdict == "ERROR":
             return (
                 "⚠️ The faithfulness check did not complete — this answer is "
                 "**unverified** against the source documents."
             )
+        score = faith_result.get("score")
         unsupported = faith_result.get("unsupported_claims") or []
         if unsupported:
             claims = "\n".join(f"- {c}" for c in unsupported[:3])
+            score_str = f" (faithfulness {score:.2f})" if score is not None else ""
             return (
-                "⚠️ Some claims in this answer were not directly supported by "
-                f"the retrieved sources:\n{claims}"
+                f"⚠️ Some claims in this answer were not directly supported "
+                f"by the retrieved sources{score_str}:\n{claims}"
+            )
+        # No flagged claims but score < 1.0 → judge couldn't fully verify.
+        if score is not None and score < 1.0:
+            return (
+                f"ℹ️ Faithfulness check returned an ambiguous result "
+                f"(score {score:.2f}). The answer was not flagged as wrong, "
+                f"but verification was inconclusive."
             )
         return ""
 

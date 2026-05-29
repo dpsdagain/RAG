@@ -6,10 +6,22 @@ startup, and provides clean shutdown.
 from __future__ import annotations
 
 import os
+import sys
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
+
+# Windows PowerShell defaults stdio to cp1252 — Unicode chars in our
+# logs / warnings (emoji, arrows, smart quotes) crash with
+# UnicodeEncodeError. Force UTF-8 stdio for stdout/stderr so the user
+# can actually read our output regardless of console codepage.
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # very old Python; safe to ignore
+        pass
 
 from fastapi import FastAPI, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,7 +35,7 @@ from app.infrastructure.config import get_settings
 from app.infrastructure.database import Database
 from app.infrastructure.observability import get_logger, metrics
 from app.ingestion.workers.ingestion_worker import IngestionWorker
-from app.models.embedder import Embedder
+from app.models.embedder import build_embedder
 from app.models.llm_client import LLMClient
 
 logger = get_logger("main")
@@ -61,21 +73,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     Path(settings.database.db_path).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.observability.log_file).parent.mkdir(parents=True, exist_ok=True)
 
-    # Initialize database
-    db = Database(settings.database.db_path)
+    # Initialize database (vector width follows the embedding dim)
+    db = Database(settings.database.db_path, dim=settings.embedding.dim)
     await db.initialize()
     app.state.db = db
 
-    # Initialize embedder
+    # Initialize embedder (local ONNX or cloud Voyage, per config.provider)
     try:
-        embedder = Embedder(
-            model_path=settings.embedding.model_path,
-            dim=settings.embedding.dim,
-            num_threads=settings.embedding.onnx_num_threads,
-        )
+        embedder = build_embedder(settings)
         app.state.embedder = embedder
         logger.info("embedder_loaded")
-    except FileNotFoundError as e:
+    except (FileNotFoundError, ImportError, ValueError) as e:
+        # Missing ONNX model, missing voyageai package, or missing API key —
+        # degrade gracefully (pipeline disabled) instead of crashing startup.
         logger.error("embedder_not_found", error=str(e))
         app.state.embedder = None
         embedder = None  # type: ignore
@@ -101,11 +111,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             count = await pipeline.rules.load_rules_from_yaml(rules_path)
             logger.info("procedural_rules_loaded", count=count)
 
-        # Start ingestion worker
+        # Start ingestion worker. The LLM is passed in so the worker
+        # can generate Contextual Retrieval headers (one short call per
+        # ingested doc); without it ingestion falls back to header-less
+        # behavior with no functional impact.
         cpu_semaphore = threading.Semaphore(1)
         worker = IngestionWorker(
             db=db, embedder=embedder, settings=settings,
             cpu_semaphore=cpu_semaphore,
+            llm=llm,
         )
         worker.start()
         app.state.ingestion_worker = worker

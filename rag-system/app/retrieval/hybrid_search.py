@@ -6,6 +6,7 @@ methods into a single high-quality result set.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections import defaultdict
 
@@ -22,6 +23,64 @@ _DEFAULT_DENSE_TOP_K: int = 50
 _DEFAULT_SPARSE_TOP_K: int = 50
 _DEFAULT_RRF_K: int = 60
 _DEFAULT_RRF_TOP_N: int = 100
+
+
+# ---------------------------------------------------------------------------
+# Symbol Guarantee — ported and adapted from new_llm_v2_modified
+# ---------------------------------------------------------------------------
+# A query like "What is RETRIEVER_K?" contains a code symbol. The chunk
+# that DEFINES that symbol (`RETRIEVER_K = 12`) is short, has weak dense
+# signal, and may lose RRF to longer usage-site chunks. The Symbol
+# Guarantee detects code-shaped identifiers in the query and force-
+# includes the BM25-best matching chunk past the RRF cut.
+#
+# Strict no-op on natural-language queries — only fires when the query
+# contains ALL_CAPS (≥4 chars) or snake_case (with underscore, ≥4 chars).
+
+# Match ALL_CAPS constants like RETRIEVER_K, MAX_CACHE_CHECKPOINTS
+_ALL_CAPS_RE = re.compile(r"\b[A-Z][A-Z0-9_]{3,}\b")
+# Match snake_case identifiers like compress_chat_history, get_embedding_model
+_SNAKE_CASE_RE = re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b")
+
+# Match a filename in the query — letters/digits/underscore + dot + 1-5 char extension.
+# Common extensions we expect to see in queries about codebases / docs.
+_FILENAME_RE = re.compile(
+    r"\b([A-Za-z0-9_-]+\.(?:py|js|ts|tsx|jsx|go|rs|java|c|cpp|h|hpp|md|txt|csv|json|yaml|yml|toml|sql|sh|ps1|html|css|cfg|ini))\b",
+    re.IGNORECASE,
+)
+
+
+def extract_filename_candidates(query: str) -> list[str]:
+    """Return filenames (with extension) mentioned in the query.
+
+    Deduplicated, original case preserved. Empty list when no filenames.
+    """
+    found = _FILENAME_RE.findall(query)
+    seen: set[str] = set()
+    out: list[str] = []
+    for fname in found:
+        if fname not in seen:
+            seen.add(fname)
+            out.append(fname)
+    return out
+
+
+def extract_symbol_candidates(query: str) -> list[str]:
+    """Return code-shaped identifiers from the query.
+
+    Returns a deduplicated list combining ALL_CAPS constants and
+    snake_case identifiers. Empty list for prose queries.
+    """
+    caps = _ALL_CAPS_RE.findall(query)
+    snake = _SNAKE_CASE_RE.findall(query)
+    # Dedup while preserving order
+    seen: set[str] = set()
+    out: list[str] = []
+    for sym in caps + snake:
+        if sym not in seen:
+            seen.add(sym)
+            out.append(sym)
+    return out
 
 
 class HybridSearchEngine:
@@ -75,8 +134,9 @@ class HybridSearchEngine:
         """
         t0 = time.perf_counter()
 
-        # 1. Embed query
-        query_embedding: list[float] = self._embedder.embed(query)
+        # 1. Embed query (input_type='query' lets Voyage apply its query
+        #    prompt; the local ONNX embedder ignores the kwarg)
+        query_embedding: list[float] = self._embedder.embed(query, input_type="query")
 
         # 2. Run dense and sparse searches concurrently
         dense_task = asyncio.create_task(
@@ -154,7 +214,26 @@ class HybridSearchEngine:
                 )
             merged_results.append(chunk)
 
-        # 5. Metrics
+        # 5. Symbol Guarantee — rescue exact-symbol-named chunks past RRF cut.
+        merged_results = await self._apply_symbol_guarantee(
+            query, merged_results, top_n
+        )
+
+        # 5b. Filename Guarantee — when the user names a file, ensure at
+        # least one chunk from that file is in the results.
+        merged_results = await self._apply_filename_guarantee(
+            query, merged_results, top_n
+        )
+
+        # 5c. Call-graph propagation: for queries that look like "where is X
+        # used?" / "what calls Y?" / "trace flow of Z", hit the dedicated
+        # chunks_symbols_fts index for every symbol in the query and rescue
+        # the top hits past the RRF cut. No-op when no symbols in the query.
+        merged_results = await self._apply_call_graph_rescue(
+            query, merged_results, top_n
+        )
+
+        # 6. Metrics
         elapsed_ms = (time.perf_counter() - t0) * 1000
         metrics.record_latency("hybrid_search", elapsed_ms)
         metrics.increment("hybrid_search_count")
@@ -166,6 +245,210 @@ class HybridSearchEngine:
         )
 
         return merged_results
+
+    async def _apply_symbol_guarantee(
+        self,
+        query: str,
+        current_results: list[ChunkResult],
+        top_n: int,
+    ) -> list[ChunkResult]:
+        """Force-include chunks defining code symbols mentioned in the query.
+
+        For each ALL_CAPS or snake_case identifier in the query, do a
+        targeted BM25 lookup for that exact symbol. If the best match
+        isn't already in current_results, prepend it. Bounded by the
+        original top_n (the rescued chunks displace lowest-ranked
+        existing ones, so total never exceeds top_n).
+
+        Strict no-op on prose queries: no symbols → no extra BM25 calls,
+        original ranking returned unchanged.
+        """
+        symbols = extract_symbol_candidates(query)
+        if not symbols:
+            return current_results
+
+        existing_ids = {c.chunk_id for c in current_results}
+        rescued: list[ChunkResult] = []
+
+        # Cap to first 3 symbols to bound work — a single query with 10
+        # identifiers is unusual and probably a copy-paste.
+        for sym in symbols[:3]:
+            try:
+                # Use the symbol itself as a BM25 query — FTS5's porter+
+                # unicode61 tokenizer preserves underscores, so RETRIEVER_K
+                # and compress_chat_history match exactly.
+                hits = await self._db.bm25_search(sym, top_k=3)
+            except Exception as e:
+                logger.warning("symbol_guarantee_bm25_failed", symbol=sym, error=str(e))
+                continue
+
+            for hit in hits:
+                if hit.chunk_id in existing_ids:
+                    continue  # already in results, no need to rescue
+                # First not-already-present hit for this symbol is enough.
+                rescued.append(hit)
+                existing_ids.add(hit.chunk_id)
+                break
+
+        if not rescued:
+            return current_results
+
+        metrics.increment("symbol_guarantee_rescues", value=len(rescued))
+        logger.info(
+            "symbol_guarantee_applied",
+            symbols=symbols[:3],
+            rescued=len(rescued),
+        )
+
+        # Prepend rescued chunks. Trim from the tail to keep top_n.
+        combined = rescued + current_results
+        return combined[:top_n]
+
+    async def _apply_filename_guarantee(
+        self,
+        query: str,
+        current_results: list[ChunkResult],
+        top_n: int,
+    ) -> list[ChunkResult]:
+        """Force-include at least one chunk from each filename in the query.
+
+        A query like "what's in config.py?" should always surface a chunk
+        from config.py even if BM25/dense don't rank it. Tiny zero-chunk
+        files lose ranking to multi-chunk files; this rescues them.
+
+        Strict no-op when the query contains no filename.
+        """
+        filenames = extract_filename_candidates(query)
+        if not filenames:
+            return current_results
+
+        # Which filenames are already represented?
+        present_basenames = set()
+        for c in current_results:
+            uri = c.source_uri or ""
+            if uri:
+                # Use the basename so absolute-path source_uri matches the
+                # bare filename the user typed.
+                from os.path import basename
+                present_basenames.add(basename(uri).lower())
+
+        rescued: list[ChunkResult] = []
+        existing_ids = {c.chunk_id for c in current_results}
+
+        for fname in filenames[:3]:  # cap, same reasoning as symbol guarantee
+            if fname.lower() in present_basenames:
+                continue  # already represented in results
+
+            try:
+                # Rank chunks by filename match. We rely on the BM25 search
+                # but also need to filter to that file's chunks. Cheapest:
+                # use BM25 with the file's basename — chunks from that file
+                # often mention it (especially after Contextual Retrieval
+                # headers are added).
+                hits = await self._db.bm25_search(fname, top_k=5)
+            except Exception as e:
+                logger.warning("filename_guarantee_bm25_failed", filename=fname, error=str(e))
+                continue
+
+            for hit in hits:
+                if hit.chunk_id in existing_ids:
+                    continue
+                # Prefer a hit whose source_uri ACTUALLY matches the filename.
+                from os.path import basename
+                if hit.source_uri and basename(hit.source_uri).lower() == fname.lower():
+                    rescued.append(hit)
+                    existing_ids.add(hit.chunk_id)
+                    break
+            else:
+                # Fallback: take the first non-present hit even if source_uri
+                # doesn't match — better than no rescue.
+                for hit in hits:
+                    if hit.chunk_id not in existing_ids:
+                        rescued.append(hit)
+                        existing_ids.add(hit.chunk_id)
+                        break
+
+        if not rescued:
+            return current_results
+
+        metrics.increment("filename_guarantee_rescues", value=len(rescued))
+        logger.info(
+            "filename_guarantee_applied",
+            filenames=filenames[:3],
+            rescued=len(rescued),
+        )
+
+        combined = rescued + current_results
+        return combined[:top_n]
+
+    # Keywords that signal a propagation / call-graph query. Symbols in
+    # the query are routed through chunks_symbols_fts when ANY of these
+    # phrases is present. Strict: requires both a symbol AND a propagation
+    # keyword to avoid hijacking simple lookup queries.
+    _PROPAGATION_KEYWORDS = (
+        "where is", "who calls", "what calls", "what uses", "where used",
+        "trace ", "propagat", "callers of", "called by", "flow of",
+        "how is.* used", "what references", "where does.*come from",
+    )
+
+    async def _apply_call_graph_rescue(
+        self,
+        query: str,
+        current_results: list[ChunkResult],
+        top_n: int,
+    ) -> list[ChunkResult]:
+        """For propagation queries naming a code symbol, rescue caller
+        chunks via the dedicated chunks_symbols_fts index.
+
+        Only fires when:
+          (a) the query contains a code-shaped symbol (ALL_CAPS or
+              snake_case identifier), AND
+          (b) the query contains a propagation phrase ("where is", "trace",
+              "what calls", etc.)
+
+        Strict no-op on lookup queries — those are already handled by the
+        Symbol Guarantee.
+        """
+        symbols = extract_symbol_candidates(query)
+        if not symbols:
+            return current_results
+
+        q_lower = query.lower()
+        is_propagation = any(re.search(kw, q_lower) for kw in self._PROPAGATION_KEYWORDS)
+        if not is_propagation:
+            return current_results
+
+        existing_ids = {c.chunk_id for c in current_results}
+        rescued: list[ChunkResult] = []
+
+        for sym in symbols[:3]:
+            try:
+                hits = await self._db.search_by_symbol(sym, top_k=5)
+            except Exception as e:
+                logger.warning("call_graph_rescue_failed", symbol=sym, error=str(e))
+                continue
+            for hit in hits:
+                if hit.chunk_id in existing_ids:
+                    continue
+                rescued.append(hit)
+                existing_ids.add(hit.chunk_id)
+                if len(rescued) >= 5:  # cap rescues per query
+                    break
+            if len(rescued) >= 5:
+                break
+
+        if not rescued:
+            return current_results
+
+        metrics.increment("call_graph_rescues", value=len(rescued))
+        logger.info(
+            "call_graph_rescue_applied",
+            symbols=symbols[:3],
+            rescued=len(rescued),
+        )
+
+        combined = rescued + current_results
+        return combined[:top_n]
 
     async def search_multi_query(
         self,

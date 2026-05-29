@@ -52,7 +52,15 @@ class FakeLLMClient:
         joined = " ".join(m.get("content", "") for m in messages).lower()
         if "rate the retrieval" in joined:
             return self._canned_crag
-        if "supported by the source" in joined or "all claims verified" in joined:
+        # Faithfulness judge prompt — match either the old phrasing or
+        # the new RAGAS-style "label each one as SUPPORTED/UNSUPPORTED"
+        # phrasing introduced in the v2 faithfulness rewrite.
+        if (
+            "supported by the source" in joined
+            or "all claims verified" in joined
+            or "label each one" in joined
+            or "grounded in the provided source" in joined
+        ):
             return self._canned_faith
         if "break the following" in joined or "sub-question" in joined:
             return '["sub-query one", "sub-query two"]'

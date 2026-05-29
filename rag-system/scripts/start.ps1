@@ -23,8 +23,13 @@ if ($freeGB -lt 2) {
 # Set environment variables
 $env:OMP_NUM_THREADS = "4"
 $env:TOKENIZERS_PARALLELISM = "false"
+# Force Python to use UTF-8 for stdio so emoji / arrows / smart quotes in
+# logs and warnings don't crash with UnicodeEncodeError on cp1252 consoles.
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
 Write-Host "OMP_NUM_THREADS=$env:OMP_NUM_THREADS"
 Write-Host "TOKENIZERS_PARALLELISM=$env:TOKENIZERS_PARALLELISM"
+Write-Host "PYTHONUTF8=$env:PYTHONUTF8"
 
 # Activate venv if exists
 $venvPath = Join-Path $PSScriptRoot ".." ".venv" "Scripts" "Activate.ps1"

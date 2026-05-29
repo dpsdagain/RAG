@@ -10,12 +10,19 @@
 database:
   db_path: "./data/rag.db"
 
-# ── Embedding model (ONNX Runtime) ──
+# ── Embedding model ──
+# provider=voyage uses Voyage AI's voyage-code-3 (cloud), tuned for code AND
+# documentation retrieval — the best fit for a codebase+document corpus.
+# Set RAG_EMBEDDING__API_KEY in .env (never commit the key).
+# Switch provider back to "onnx" to use the local bge-small (dim 384, offline,
+# no key). NOTE: changing provider/dim requires a fresh DB + re-ingest.
 embedding:
-  model_path: "BAAI/bge-small-en-v1.5"
-  dim: 384
+  provider: "voyage"                  # voyage (cloud voyage-code-3) | onnx (local bge-small)
+  model_path: "voyage-code-3"         # Voyage model name when provider=voyage
+  dim: 1024                           # voyage-code-3 Matryoshka dims: 256/512/1024/2048
   onnx_threads: 4
   batch_size: 64
+  api_key: ""                         # REDACTED: set RAG_EMBEDDING__API_KEY in .env
 
 # ── LLM provider ──
 llm:
@@ -44,7 +51,13 @@ retrieval:
   rrf_top_n: 100
   rerank_top_k: 15
   context_budget_tokens: 12000
-  rerank_model: "ms-marco-MiniLM-L-12-v2"
+  # rerank-2.5: Voyage AI cloud reranker, strong on code AND prose. Uses the
+  # same Voyage key as the embedder (RAG_EMBEDDING__API_KEY) and runs in the
+  # cloud, so it sidesteps the heavy local CPU cost of cross-encoders
+  # (bge-reranker-v2-m3 took ~5min/query on this CPU). Auto-routes to the
+  # Voyage backend in reranker.py; falls back to local FlashRank ms-marco if no
+  # key. Set to 'ms-marco-MiniLM-L-12-v2' to force the local reranker.
+  rerank_model: "rerank-2.5"
 
 # ── Advanced pipeline features ──
 # CRAG is disabled by default — it adds one cloud LLM call per query and
@@ -55,6 +68,13 @@ pipeline:
   crag_enabled: false
   decomposition_enabled: true
   faithfulness_check_enabled: true
+  # Agentic ReAct retrieval: the LLM drives an iterative search/read loop
+  # instead of one-shot retrieve+decompose. Better for multi-hop and code
+  # questions (e.g. "where is X used and what calls it?"). Costs one extra
+  # cheap cloud LLM call per iteration — no new local model, so it is NOT
+  # hardware-bound. Off by default; flip to true to enable.
+  agentic_enabled: false
+  agentic_max_iterations: 5
 
 # ── Memory subsystem ──
 memory:

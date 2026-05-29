@@ -23,6 +23,7 @@ from app.ingestion.chunking.code_chunker import CodeChunker
 from app.ingestion.chunking.semantic_chunker import SemanticChunker
 from app.ingestion.router import IngestionRouter
 from app.models.embedder import Embedder
+from app.models.llm_client import LLMClient
 
 logger = get_logger("ingestion.worker")
 
@@ -54,11 +55,16 @@ class IngestionWorker(threading.Thread):
         embedder: Embedder,
         settings: Settings,
         cpu_semaphore: threading.Semaphore | None = None,
+        llm: LLMClient | None = None,
     ) -> None:
         super().__init__(daemon=True, name="IngestionWorker")
         self._db = db
         self._embedder = embedder
         self._settings = settings
+        # Optional LLM used only at ingest for the Contextual Retrieval
+        # header (one short call per doc). If None, headers are skipped
+        # and ingestion behaves as before.
+        self._llm = llm
         self._router = IngestionRouter()
         self._chunker = SemanticChunker(
             embedder=embedder,
@@ -154,13 +160,25 @@ class IngestionWorker(threading.Thread):
             # Step 2: Parse
             parsed = await self._router.parse_file(file_path)
 
+            # Step 2b: Contextual header (Anthropic Contextual Retrieval).
+            # One LLM call per file → 1-sentence summary. The header gets
+            # prepended to every chunk's content before embedding so terse
+            # chunks (e.g. `RETRIEVER_K = 12`) carry their file's context
+            # into the embedding space. Best documented ~60% retrieval
+            # failure reduction in Anthropic's paper.
+            contextual_header = await self._make_contextual_header(parsed, filename)
+
             # Step 3: Chunk (with CPU semaphore for embedding)
             self._cpu_semaphore.acquire()
             try:
                 if parsed.source_type == "code":
-                    chunks = self._code_chunker.chunk(parsed, doc_id)
+                    chunks = self._code_chunker.chunk(
+                        parsed, doc_id, contextual_header=contextual_header
+                    )
                 else:
-                    chunks = self._chunker.chunk(parsed, doc_id)
+                    chunks = self._chunker.chunk(
+                        parsed, doc_id, contextual_header=contextual_header
+                    )
             finally:
                 self._cpu_semaphore.release()
 
@@ -248,10 +266,15 @@ class IngestionWorker(threading.Thread):
             # Dedup by content hash
             content_hash = hashlib.sha256(parsed.content.encode()).hexdigest()
 
+            # Contextual header (same as file ingest path).
+            contextual_header = await self._make_contextual_header(parsed, url)
+
             # Chunk
             self._cpu_semaphore.acquire()
             try:
-                chunks = self._chunker.chunk(parsed, doc_id)
+                chunks = self._chunker.chunk(
+                    parsed, doc_id, contextual_header=contextual_header
+                )
             finally:
                 self._cpu_semaphore.release()
 
@@ -299,6 +322,56 @@ class IngestionWorker(threading.Thread):
                 doc_id=doc_id, filename=url,
                 status="failed", error_message=str(e),
             )
+
+    async def _make_contextual_header(self, parsed, filename: str) -> str:
+        """Generate a 1-sentence contextual header for the parsed document.
+
+        Returns a short summary like
+        *"This file (config.py) holds the retrieval/cache tuning constants."*
+        that gets prepended to every chunk before embedding. Improves
+        retrieval precision on terse chunks (constant definitions, short
+        utility functions) that have weak standalone signal.
+
+        On any failure (no LLM configured, API error, empty input) returns
+        an empty string — ingestion continues without the header, falling
+        back to pre-Contextual-Retrieval behavior.
+        """
+        if self._llm is None or not parsed.content:
+            return ""
+
+        # Send only the first ~3000 chars to keep the call cheap and
+        # predictable. The summary is about the doc as a WHOLE, not
+        # per-chunk, so the head usually contains enough signal.
+        snippet = parsed.content[:3000]
+        title_hint = parsed.title or filename
+        prompt = (
+            f"In ONE sentence (max 25 words), describe what this document is "
+            f"about. Be specific: name the topic, the file's apparent role, "
+            f"or its main subject matter. Do NOT preface with 'This document' "
+            f"or 'The file' — just state the topic directly.\n\n"
+            f"FILE: {title_hint}\n\n"
+            f"CONTENT (truncated):\n{snippet}"
+        )
+        messages = [{"role": "user", "content": prompt}]
+
+        try:
+            response = await self._llm.generate(
+                messages, temperature=0.0, max_tokens=80
+            )
+            # Strip surrounding whitespace and clip to 200 chars defensively.
+            header = response.strip().replace("\n", " ")[:200]
+            if header:
+                metrics.increment("contextual_headers_generated")
+                logger.info(
+                    "contextual_header",
+                    file=filename,
+                    header_preview=header[:80],
+                )
+            return header
+        except Exception as e:
+            logger.warning("contextual_header_failed", file=filename, error=str(e))
+            metrics.increment("contextual_header_errors")
+            return ""
 
     @staticmethod
     def _compute_file_hash(file_path: Path) -> str:

@@ -13,7 +13,7 @@ async def run_evaluation():
     """Run evaluation against the golden set queries."""
     from app.infrastructure.config import get_settings
     from app.infrastructure.database import Database
-    from app.models.embedder import Embedder
+    from app.models.embedder import build_embedder
     from app.models.llm_client import LLMClient
     from app.core.pipeline import RAGPipeline
 
@@ -31,12 +31,9 @@ async def run_evaluation():
         queries = json.load(f)
 
     # Initialize pipeline
-    db = Database(settings.database.db_path)
+    db = Database(settings.database.db_path, dim=settings.embedding.dim)
     await db.initialize()
-    embedder = Embedder(
-        model_path=settings.embedding.model_path,
-        dim=settings.embedding.dim,
-    )
+    embedder = build_embedder(settings)
     llm = LLMClient(
         provider=settings.llm.provider,
         base_url=settings.llm.base_url,

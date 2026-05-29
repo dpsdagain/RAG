@@ -51,16 +51,26 @@ class SemanticChunker:
         self._min_tokens = min_chunk_tokens
         self._threshold = semantic_threshold
 
-    def chunk(self, parsed_doc: ParsedDocument, doc_id: str) -> list[ChunkRecord]:
+    def chunk(
+        self,
+        parsed_doc: ParsedDocument,
+        doc_id: str,
+        contextual_header: str = "",
+    ) -> list[ChunkRecord]:
         """Chunk a parsed document into semantically coherent segments.
 
         Args:
             parsed_doc: The parsed document content.
             doc_id: Document ID to associate chunks with.
+            contextual_header: Optional 1-sentence summary of the parent
+                document. When non-empty, gets prepended to every chunk's
+                content before embedding (Anthropic Contextual Retrieval).
+                Terse chunks like `RETRIEVER_K = 12` benefit most.
 
         Returns:
             List of ChunkRecord objects with embeddings already computed.
         """
+        self._contextual_header = contextual_header
         content = parsed_doc.content
         if not content or not content.strip():
             return []
@@ -374,8 +384,17 @@ class SemanticChunker:
         if not chunks:
             return []
 
-        # Batch embed all chunk texts
-        texts = [c["text"] for c in chunks]
+        # Contextual Retrieval: prepend the per-document header to every
+        # chunk's text BEFORE embedding. Each stored chunk also keeps the
+        # header in its content so the LLM sees the same prefix at
+        # retrieval time. Empty header → no-op (backwards-compatible).
+        header = getattr(self, "_contextual_header", "") or ""
+        header_prefix = f"{header}\n\n" if header else ""
+
+        # Batch embed chunk texts WITH the header so the embedding space
+        # carries the doc-level context. Critical for terse chunks like
+        # `RETRIEVER_K = 12`.
+        texts = [f"{header_prefix}{c['text']}" for c in chunks]
         embeddings = self._embedder.embed_batch(texts)
 
         sentence_embeddings = sentence_embeddings or []
@@ -389,8 +408,11 @@ class SemanticChunker:
         records: list[ChunkRecord] = []
         for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
             chunk_id = str(uuid.uuid4())
-            content_hash = hashlib.sha256(chunk["text"].encode()).hexdigest()
-            token_count = self._embedder.count_tokens(chunk["text"])
+            # Store the header in the content so the LLM sees it at
+            # retrieval time, and hash that combined text.
+            content_with_header = f"{header_prefix}{chunk['text']}"
+            content_hash = hashlib.sha256(content_with_header.encode()).hexdigest()
+            token_count = self._embedder.count_tokens(content_with_header)
             section = chunk.get("section_title")
 
             # Assign parent chunk ID for section grouping
@@ -430,7 +452,7 @@ class SemanticChunker:
             records.append(ChunkRecord(
                 chunk_id=chunk_id,
                 doc_id=doc_id,
-                content=chunk["text"],
+                content=content_with_header,
                 embedding=embedding,
                 chunk_index=i,
                 parent_chunk_id=parent_id,

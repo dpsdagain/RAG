@@ -25,10 +25,12 @@ class DatabaseConfig(BaseModel):
 
 class EmbeddingConfig(BaseModel):
     """Embedding model settings."""
-    model_path: str = Field(default="BAAI/bge-small-en-v1.5", description="HuggingFace model ID or local path")
-    dim: int = Field(default=384, description="Embedding vector dimensions")
+    provider: str = Field(default="onnx", description="Embedding backend: 'onnx' (local bge-small) or 'voyage' (cloud voyage-code-3)")
+    model_path: str = Field(default="BAAI/bge-small-en-v1.5", description="HF model id/local path (onnx) or Voyage model name (voyage)")
+    dim: int = Field(default=384, description="Embedding vector dimensions (bge-small=384, voyage-code-3=1024)")
     onnx_num_threads: int = Field(default=4, description="ONNX Runtime CPU threads")
     batch_size: int = Field(default=64, description="Sentences per ONNX inference batch")
+    api_key: str = Field(default="", description="Cloud embedder API key (Voyage). Set via RAG_EMBEDDING__API_KEY in .env — never commit.")
 
 
 class LLMConfig(BaseModel):
@@ -61,7 +63,17 @@ class RetrievalConfig(BaseModel):
     rrf_top_n: int = Field(default=100, description="Results after RRF fusion")
     rerank_top_k: int = Field(default=15, description="Final results after reranking")
     context_budget_tokens: int = Field(default=12000, description="Max tokens for LLM context")
-    rerank_model: str = Field(default="ms-marco-MiniLM-L-12-v2", description="FlashRank model name")
+    rerank_model: str = Field(
+        default="BAAI/bge-reranker-v2-m3",
+        description=(
+            "Reranker model. 'rerank-*' names (e.g. rerank-2.5) auto-route to "
+            "the Voyage cloud reranker (shares the embedder's Voyage key). HF "
+            "repo ids (e.g. BAAI/bge-reranker-v2-m3, "
+            "jinaai/jina-reranker-v2-code) auto-route to sentence-transformers "
+            "CrossEncoder. FlashRank built-in names (e.g. "
+            "ms-marco-MiniLM-L-12-v2) auto-route to FlashRank."
+        ),
+    )
 
 
 class PipelineConfig(BaseModel):
@@ -71,6 +83,13 @@ class PipelineConfig(BaseModel):
     crag_enabled: bool = Field(default=False, description="Enable CRAG quality gate")
     decomposition_enabled: bool = Field(default=True, description="Enable query decomposition")
     faithfulness_check_enabled: bool = Field(default=True, description="Enable post-gen faithfulness check")
+    # Agentic ReAct retrieval defaults OFF — it trades extra cloud LLM calls
+    # (one cheap planning call per iteration) for better multi-hop recall.
+    # When ON it replaces the one-shot retrieve+decompose stage with an
+    # iterative search/read loop. No new local model, so it is not
+    # hardware-bound; the cost is tokens + latency, bounded by max_iterations.
+    agentic_enabled: bool = Field(default=False, description="Enable agentic ReAct retrieval loop")
+    agentic_max_iterations: int = Field(default=5, description="Max planning iterations in the agentic loop")
 
 
 class MemoryConfig(BaseModel):

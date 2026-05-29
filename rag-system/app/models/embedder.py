@@ -6,6 +6,7 @@ CPU-first execution with configurable thread counts and L2 normalization.
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -134,11 +135,14 @@ class Embedder:
         default_dir.mkdir(parents=True, exist_ok=True)
         return default_dir
 
-    def embed(self, text: str) -> list[float]:
+    def embed(self, text: str, input_type: str = "document") -> list[float]:
         """Embed a single text string.
 
         Args:
             text: Input text to embed.
+            input_type: Accepted for interface parity with cloud embedders
+                        (e.g. Voyage query/document prompts). Ignored here —
+                        bge-small has no input-type conditioning.
 
         Returns:
             L2-normalized embedding vector of length self._dim.
@@ -146,12 +150,15 @@ class Embedder:
         result = self.embed_batch([text])
         return result[0]
 
-    def embed_batch(self, texts: list[str], batch_size: int = 64) -> list[list[float]]:
+    def embed_batch(
+        self, texts: list[str], batch_size: int = 64, input_type: str = "document"
+    ) -> list[list[float]]:
         """Embed multiple texts in batches.
 
         Args:
             texts: List of texts to embed.
             batch_size: Number of texts per inference batch.
+            input_type: Ignored (interface parity — see embed()).
 
         Returns:
             List of L2-normalized embedding vectors.
@@ -238,6 +245,157 @@ class Embedder:
     def dim(self) -> int:
         """Return the embedding dimension."""
         return self._dim
+
+
+class VoyageEmbedder:
+    """Cloud embedder backed by Voyage AI (voyage-code-3 by default).
+
+    Drop-in replacement for ``Embedder`` — same embed/embed_batch/
+    count_tokens/dim surface — but calls the Voyage API instead of running
+    a local ONNX model. Chosen for a codebase+document corpus: voyage-code-3
+    is tuned for code retrieval *and* documentation.
+
+    Notes:
+      * input_type matters for retrieval quality: documents are embedded with
+        "document" and queries with "query" (Voyage prepends a tuned prompt).
+      * Outputs are L2-normalized so cosine ranking via sqlite-vec L2 distance
+        is preserved, matching the local Embedder's contract.
+      * count_tokens uses Voyage's own tokenizer (local after a one-time
+        fetch) with a char-based fallback so chunking never hits the network
+        per sentence in a degraded environment.
+    """
+
+    _MAX_BATCH = 128          # Voyage per-request text cap
+    _VALID_INPUT = ("query", "document")
+
+    def __init__(
+        self,
+        model: str = "voyage-code-3",
+        dim: int = 1024,
+        api_key: str = "",
+        max_retries: int = 3,
+    ) -> None:
+        self._model = model
+        self._dim = dim
+        self._max_retries = max(1, max_retries)
+        self._tokenizer_failed = False
+
+        try:
+            import voyageai
+        except ImportError as e:
+            raise ImportError(
+                "voyageai is required for the Voyage embedder. "
+                "Install it with: pip install voyageai"
+            ) from e
+
+        key = (
+            api_key
+            or os.getenv("RAG_EMBEDDING__API_KEY", "")
+            or os.getenv("VOYAGE_API_KEY", "")
+        )
+        if not key:
+            raise ValueError(
+                "Voyage API key missing. Set RAG_EMBEDDING__API_KEY in .env "
+                "(or VOYAGE_API_KEY) to use the Voyage embedder."
+            )
+
+        self._client = voyageai.Client(api_key=key)
+        logger.info("embedder_loaded", model=model, dim=dim, backend="voyage")
+
+    def embed(self, text: str, input_type: str = "document") -> list[float]:
+        """Embed a single text. ``input_type`` is 'query' or 'document'."""
+        return self.embed_batch([text], input_type=input_type)[0]
+
+    def embed_batch(
+        self, texts: list[str], batch_size: int = 128, input_type: str = "document"
+    ) -> list[list[float]]:
+        """Embed many texts, batching to respect Voyage's per-request cap."""
+        if not texts:
+            return []
+        it = input_type if input_type in self._VALID_INPUT else "document"
+        bs = max(1, min(batch_size, self._MAX_BATCH))
+
+        # Voyage rejects empty/whitespace-only strings ("Input cannot contain
+        # empty strings"), but code chunkers can legitimately emit blank chunks
+        # (e.g. empty imports blocks). Local ONNX tolerates them. Replace with a
+        # single space to keep the 1:1 index mapping the caller relies on.
+        texts = [t if (t and t.strip()) else " " for t in texts]
+
+        out: list[list[float]] = []
+        for i in range(0, len(texts), bs):
+            out.extend(self._embed_call(texts[i: i + bs], it))
+        return out
+
+    def _embed_call(self, batch: list[str], input_type: str) -> list[list[float]]:
+        """One Voyage embed request with retry/backoff on transient errors."""
+        last_err: Exception | None = None
+        for attempt in range(self._max_retries):
+            try:
+                with metrics.timer("embed_batch"):
+                    resp = self._client.embed(
+                        batch,
+                        model=self._model,
+                        input_type=input_type,
+                        output_dimension=self._dim,
+                    )
+                return self._normalize(resp.embeddings)
+            except Exception as e:  # network / rate-limit / API error
+                last_err = e
+                if attempt < self._max_retries - 1:
+                    time.sleep(0.5 * (2 ** attempt))
+        metrics.increment("embed_errors")
+        raise RuntimeError(
+            f"Voyage embed failed after {self._max_retries} attempts: {last_err}"
+        ) from last_err
+
+    @staticmethod
+    def _normalize(vectors: list[list[float]]) -> list[list[float]]:
+        """L2-normalize a batch (idempotent if Voyage already returns unit vecs)."""
+        arr = np.asarray(vectors, dtype=np.float32)
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        norms = np.clip(norms, a_min=1e-12, a_max=None)
+        return (arr / norms).tolist()
+
+    def count_tokens(self, text: str) -> int:
+        """Token count via Voyage's tokenizer; char-heuristic fallback."""
+        if not self._tokenizer_failed:
+            try:
+                return int(self._client.count_tokens([text], model=self._model))
+            except Exception as e:
+                # Fall back permanently for this process so we don't retry a
+                # broken tokenizer load on every sentence during ingest.
+                self._tokenizer_failed = True
+                logger.warning("voyage_count_tokens_fallback", error=str(e))
+        return max(1, len(text) // 4)
+
+    @property
+    def dim(self) -> int:
+        """Return the embedding dimension."""
+        return self._dim
+
+
+def build_embedder(settings: Any) -> Any:
+    """Construct the embedder selected by ``settings.embedding.provider``.
+
+    'voyage'/'voyageai' → cloud VoyageEmbedder (needs an API key).
+    Anything else       → local ONNX Embedder (bge-small).
+    """
+    emb = settings.embedding
+    provider = str(getattr(emb, "provider", "onnx")).lower()
+
+    if provider in ("voyage", "voyageai"):
+        api_key = (
+            getattr(emb, "api_key", "")
+            or os.getenv("RAG_EMBEDDING__API_KEY", "")
+            or os.getenv("VOYAGE_API_KEY", "")
+        )
+        return VoyageEmbedder(model=emb.model_path, dim=emb.dim, api_key=api_key)
+
+    return Embedder(
+        model_path=emb.model_path,
+        dim=emb.dim,
+        num_threads=emb.onnx_num_threads,
+    )
 
 
 def download_model(model_name: str = "BAAI/bge-small-en-v1.5", cache_dir: str | None = None) -> Path:

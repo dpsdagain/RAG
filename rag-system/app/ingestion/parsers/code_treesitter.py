@@ -1,10 +1,22 @@
 """Tree-sitter based code parser for AST-aware code extraction.
 
 Parses source code files into their AST and extracts function definitions,
-class definitions, and top-level declarations as structured blocks.
+class definitions, and top-level declarations as structured blocks. For
+each block we also extract:
+  * calls_functions  — names of every function/method called from inside
+  * references_constants — every ALL_CAPS identifier referenced
+
+These two metadata streams power the call-graph + constants FTS5 index,
+which enables propagation queries ("where is OPENROUTER_API_KEY used?",
+"trace how chunks flow through hybrid_search") to hit a direct symbol
+index instead of relying on fuzzy embedding match.
+
+Per-language correctness: extraction walks tree-sitter nodes per
+language, so it works for Python, JS/TS, Go, Rust, Java, C, C++.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +57,25 @@ EXTRACT_TYPES: dict[str, set[str]] = {
     "c": {"function_definition", "struct_specifier"},
     "cpp": {"function_definition", "class_specifier", "struct_specifier"},
 }
+
+# Tree-sitter node types that represent a function/method call,
+# per language. Walking the AST and collecting these gives us a clean
+# call graph that works without regex heuristics.
+CALL_NODE_TYPES: dict[str, set[str]] = {
+    "python": {"call"},
+    "javascript": {"call_expression"},
+    "typescript": {"call_expression"},
+    "go": {"call_expression"},
+    "rust": {"call_expression", "macro_invocation"},
+    "java": {"method_invocation"},
+    "c": {"call_expression"},
+    "cpp": {"call_expression"},
+}
+
+# Identifiers we consider "constants" for the references_constants index.
+# ALL_CAPS, at least 4 chars, may contain digits/underscores. Tight enough
+# to avoid noise (e.g. single-letter loop vars).
+_CONSTANT_RE = re.compile(r"^[A-Z][A-Z0-9_]{3,}$")
 
 
 class CodeTreeSitterParser(BaseParser):
@@ -178,6 +209,13 @@ class CodeTreeSitterParser(BaseParser):
                                         break
                             break
 
+            # Walk THIS block's subtree to collect calls + constants.
+            # We don't recurse into nested function definitions for
+            # call extraction — they get their own block entries.
+            calls, constants = self._extract_calls_and_constants(
+                node, source, language
+            )
+
             blocks.append({
                 "name": name,
                 "type": node_type,
@@ -186,11 +224,82 @@ class CodeTreeSitterParser(BaseParser):
                 "content": node_content,
                 "docstring": docstring,
                 "language": language,
+                "calls_functions": calls,
+                "references_constants": constants,
             })
 
         # Recurse into children
         for child in node.children:
             self._extract_nodes(child, source, types, blocks, language)
+
+    @classmethod
+    def _extract_calls_and_constants(
+        cls, root_node: Any, source: str, language: str,
+    ) -> tuple[list[str], list[str]]:
+        """Walk a subtree, collect every call name + ALL_CAPS identifier.
+
+        Returns (sorted_unique_calls, sorted_unique_constants).
+        Both lists are deduplicated; empty lists when none found or
+        when the language has no known call-node-type mapping.
+        """
+        call_types = CALL_NODE_TYPES.get(language, set())
+        calls: set[str] = set()
+        constants: set[str] = set()
+
+        def _walk(n: Any) -> None:
+            try:
+                ntype = n.type
+            except Exception:
+                return
+
+            # Call expression: take the FIRST identifier-like child as the
+            # function name. This handles `foo()`, `obj.foo()`, `Type::foo()`.
+            if ntype in call_types:
+                fn_name = cls._first_identifier(n, source)
+                if fn_name:
+                    calls.add(fn_name)
+
+            # Standalone identifier: check if it's ALL_CAPS constant.
+            if ntype in ("identifier", "name", "property_identifier"):
+                text = source[n.start_byte:n.end_byte]
+                if _CONSTANT_RE.match(text):
+                    constants.add(text)
+
+            for child in n.children:
+                _walk(child)
+
+        _walk(root_node)
+        return sorted(calls), sorted(constants)
+
+    @staticmethod
+    def _first_identifier(node: Any, source: str) -> str | None:
+        """Return the function name from a call_expression node.
+
+        Walks ONLY the function expression (first child of the call),
+        not the arguments, so we don't accidentally pick up identifiers
+        from inside the call's parameter list.
+
+        For `obj.method()` → "method"; for `Type::foo()` → "foo".
+        Returns the last identifier in the chain — that's the actual
+        function name.
+        """
+        if not node.children:
+            return None
+        fn_expr = node.children[0]  # function expression, NOT args
+
+        found: list[str] = []
+
+        def _walk(n: Any) -> None:
+            try:
+                if n.type in ("identifier", "name", "property_identifier"):
+                    found.append(source[n.start_byte:n.end_byte])
+                for child in n.children:
+                    _walk(child)
+            except Exception:
+                pass
+
+        _walk(fn_expr)
+        return found[-1] if found else None
 
     @staticmethod
     def _fallback_parse(content: str, source: Path) -> ParsedDocument:

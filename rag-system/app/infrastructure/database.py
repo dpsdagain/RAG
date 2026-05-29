@@ -117,9 +117,10 @@ class Database:
     All blocking SQLite calls are dispatched via asyncio.to_thread().
     """
 
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(self, db_path: str | Path, dim: int = 384) -> None:
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._dim = dim
         self._write_lock = Lock()
         self._conn: sqlite3.Connection | None = None
 
@@ -146,6 +147,30 @@ class Database:
             self._conn.execute("PRAGMA busy_timeout=5000")
         return self._conn
 
+    def _assert_vec_dim_compatible(self, conn: sqlite3.Connection) -> None:
+        """Guard against opening a DB whose vectors don't match self._dim.
+
+        Embeddings are model-specific; switching the embedding model changes
+        the vector width. ``CREATE VIRTUAL TABLE IF NOT EXISTS`` would silently
+        keep the old width and every insert would then fail deep in sqlite-vec.
+        Catch it here with an actionable message instead.
+        """
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='chunks_vec'"
+        ).fetchone()
+        if not row or not row[0]:
+            return  # fresh DB — will be created at self._dim
+        match = re.search(r"float\[(\d+)\]", row[0])
+        if match and int(match.group(1)) != self._dim:
+            raise RuntimeError(
+                f"Embedding dimension mismatch for {self._db_path}: the existing "
+                f"database stores {match.group(1)}-dim vectors, but the current "
+                f"config expects {self._dim}-dim. Switching embedding models "
+                f"requires a fresh database — delete or move the old .db (plus "
+                f"its -wal/-shm files) and re-ingest your corpus."
+            )
+
     async def initialize(self) -> None:
         """Create all tables and indexes. Idempotent."""
         await asyncio.to_thread(self._initialize_sync)
@@ -154,6 +179,7 @@ class Database:
     def _initialize_sync(self) -> None:
         """Synchronous table creation."""
         conn = self._get_connection()
+        self._assert_vec_dim_compatible(conn)
         with self._write_lock:
             # Documents
             conn.execute("""
@@ -196,16 +222,37 @@ class Database:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_parent ON chunks(parent_chunk_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_ingested ON chunks(ingested_at)")
 
-            # sqlite-vec virtual table for vector search
+            # sqlite-vec virtual table for vector search. The vector width is
+            # bound to the embedding model's dim (bge-small=384, voyage-code-3
+            # =1024), so it's templated from self._dim.
             try:
-                conn.execute("""
+                conn.execute(f"""
                     CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
                         chunk_id TEXT PRIMARY KEY,
-                        embedding float[384]
+                        embedding float[{self._dim}]
                     )
                 """)
             except sqlite3.OperationalError as e:
                 logger.warning("Could not create vec0 virtual table", error=str(e))
+
+            # Code-symbol FTS5 index: per-chunk call graph + ALL_CAPS
+            # constant references. Separate from the content FTS5 so
+            # propagation queries ("where is X used?") hit a focused
+            # index instead of fuzzy-matching against full chunk text.
+            # Populated by CodeChunker via the chunks_symbols_upsert
+            # helper below. Optional — chunks without code metadata
+            # (prose, markdown) simply don't appear here.
+            try:
+                conn.execute("""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS chunks_symbols_fts USING fts5(
+                        chunk_id UNINDEXED,
+                        calls,
+                        constants,
+                        tokenize='unicode61'
+                    )
+                """)
+            except sqlite3.OperationalError as e:
+                logger.warning("Could not create symbols FTS5 table", error=str(e))
 
             # FTS5 full-text search index
             try:
@@ -253,10 +300,10 @@ class Database:
             """)
             # Conversation vector search table
             try:
-                conn.execute("""
+                conn.execute(f"""
                     CREATE VIRTUAL TABLE IF NOT EXISTS conversations_vec USING vec0(
                         conversation_id TEXT PRIMARY KEY,
-                        summary_embedding float[384]
+                        summary_embedding float[{self._dim}]
                     )
                 """)
             except sqlite3.OperationalError:
@@ -402,6 +449,36 @@ class Database:
             status=row["status"],
         )
 
+    async def get_active_document_manifest(self) -> list[dict]:
+        """Return a compact list of every active document for prompt injection.
+
+        Used by the pipeline's "Corpus Manifest" feature: a small block
+        listed in the system prompt so the LLM can answer meta-questions
+        (e.g. "how many files?", "list all files", "is X in the corpus?")
+        without hallucinating based on whichever chunks happened to be
+        retrieved for the current question.
+
+        Returns dicts with: source_uri (str), source_type (str),
+        title (str | None), total_chunks (int). Ordered alphabetically
+        by source_uri so the block stays stable across queries (which
+        helps provider-side prompt caching).
+        """
+        rows = await self.fetch_all(
+            """SELECT source_uri, source_type, title, total_chunks
+               FROM documents
+               WHERE status = 'active'
+               ORDER BY source_uri"""
+        )
+        return [
+            {
+                "source_uri": row["source_uri"],
+                "source_type": row["source_type"],
+                "title": row["title"],
+                "total_chunks": row["total_chunks"],
+            }
+            for row in rows
+        ]
+
     async def delete_document(self, doc_id: str) -> None:
         """Delete a document and all its chunks (cascading)."""
         def _run() -> None:
@@ -453,8 +530,107 @@ class Database:
             return chunk.chunk_id
         return await asyncio.to_thread(_run)
 
+    async def upsert_chunk_symbols(
+        self, chunk_id: str, calls: list[str], constants: list[str]
+    ) -> None:
+        """Insert/replace this chunk's call+constants row in chunks_symbols_fts.
+
+        Stored as space-separated tokens so FTS5's unicode61 tokenizer
+        gives us fast OR/AND queries via MATCH.
+        """
+        if not calls and not constants:
+            return  # nothing to index — common for prose chunks
+
+        calls_str = " ".join(calls)
+        consts_str = " ".join(constants)
+
+        def _run() -> None:
+            conn = self._get_connection()
+            with self._write_lock:
+                # FTS5 contentless tables don't support REPLACE; emulate via
+                # delete-then-insert keyed on chunk_id. The chunk_id column
+                # is UNINDEXED but still queryable via "chunk_id = ?".
+                try:
+                    conn.execute(
+                        "DELETE FROM chunks_symbols_fts WHERE chunk_id = ?",
+                        (chunk_id,),
+                    )
+                    conn.execute(
+                        """INSERT INTO chunks_symbols_fts (chunk_id, calls, constants)
+                           VALUES (?, ?, ?)""",
+                        (chunk_id, calls_str, consts_str),
+                    )
+                    conn.commit()
+                except sqlite3.OperationalError as e:
+                    logger.warning("chunks_symbols_fts_unavailable", error=str(e))
+
+        await asyncio.to_thread(_run)
+
+    async def search_by_symbol(
+        self, symbol: str, top_k: int = 10
+    ) -> list[ChunkResult]:
+        """Find chunks that call OR reference the given symbol.
+
+        Queries the calls + constants columns of chunks_symbols_fts via
+        FTS5 MATCH. Returns full ChunkResult rows joined to chunks +
+        documents. Filters out inactive documents.
+
+        Used by the propagation-query path in HybridSearchEngine.
+        """
+        if not symbol or not symbol.strip():
+            return []
+
+        # Symbol names contain underscores; FTS5 unicode61 tokenizes them
+        # as a single token, so the symbol is searched literally.
+        fts_query = f'calls : "{symbol}" OR constants : "{symbol}"'
+
+        def _run() -> list[ChunkResult]:
+            conn = self._get_connection()
+            try:
+                rows = conn.execute(
+                    """SELECT s.chunk_id, c.doc_id, c.content, c.chunk_index,
+                              c.parent_chunk_id, c.section_title, c.source_page,
+                              c.token_count, d.source_uri, d.source_type,
+                              rank AS bm25_score
+                       FROM chunks_symbols_fts s
+                       JOIN chunks c ON c.chunk_id = s.chunk_id
+                       JOIN documents d ON d.doc_id = c.doc_id
+                       WHERE chunks_symbols_fts MATCH ?
+                         AND d.status = 'active'
+                       ORDER BY rank
+                       LIMIT ?""",
+                    (fts_query, top_k),
+                ).fetchall()
+            except sqlite3.OperationalError as e:
+                logger.warning("search_by_symbol_failed", error=str(e), symbol=symbol)
+                return []
+
+            results: list[ChunkResult] = []
+            for row in rows:
+                score = -float(row["bm25_score"]) if row["bm25_score"] else 0.0
+                results.append(ChunkResult(
+                    chunk_id=row["chunk_id"], doc_id=row["doc_id"],
+                    content=row["content"], score=score,
+                    chunk_index=row["chunk_index"],
+                    parent_chunk_id=row["parent_chunk_id"],
+                    section_title=row["section_title"],
+                    source_page=row["source_page"],
+                    token_count=row["token_count"],
+                    source_uri=row["source_uri"],
+                    source_type=row["source_type"],
+                ))
+            return results
+
+        with metrics.timer("search_by_symbol"):
+            return await asyncio.to_thread(_run)
+
     async def insert_chunks_batch(self, chunks: list[ChunkRecord]) -> list[str]:
-        """Insert multiple chunks in a single transaction. Returns list of chunk_ids."""
+        """Insert multiple chunks in a single transaction. Returns list of chunk_ids.
+
+        Also populates chunks_symbols_fts for any chunk whose metadata_json
+        carries calls_functions / references_constants — feeds the call-graph
+        propagation-query index.
+        """
         if not chunks:
             return []
 
@@ -478,6 +654,27 @@ class Database:
                         )
                     except sqlite3.OperationalError:
                         pass
+
+                    # Populate chunks_symbols_fts from metadata_json if the
+                    # chunker emitted calls/constants (code chunker only).
+                    if chunk.metadata_json:
+                        try:
+                            meta = json.loads(chunk.metadata_json)
+                            calls = meta.get("calls_functions") or []
+                            consts = meta.get("references_constants") or []
+                            if calls or consts:
+                                conn.execute(
+                                    "DELETE FROM chunks_symbols_fts WHERE chunk_id = ?",
+                                    (chunk.chunk_id,),
+                                )
+                                conn.execute(
+                                    """INSERT INTO chunks_symbols_fts
+                                       (chunk_id, calls, constants) VALUES (?, ?, ?)""",
+                                    (chunk.chunk_id, " ".join(calls), " ".join(consts)),
+                                )
+                        except (json.JSONDecodeError, sqlite3.OperationalError):
+                            pass
+
                     ids.append(chunk.chunk_id)
                 # Update document chunk count
                 if chunks:
@@ -502,7 +699,7 @@ class Database:
             "SELECT embedding FROM chunks_vec WHERE chunk_id = ?", (chunk_id,)
         )
         if vec_row is not None:
-            embedding = _deserialize_f32(vec_row["embedding"])
+            embedding = _deserialize_f32(vec_row["embedding"], self._dim)
         return ChunkRecord(
             chunk_id=row["chunk_id"], doc_id=row["doc_id"],
             content=row["content"], embedding=embedding,

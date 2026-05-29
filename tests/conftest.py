@@ -11,6 +11,17 @@ from typing import Iterator
 
 import pytest
 
+# Windows PowerShell defaults to cp1252 — pytest output containing
+# Unicode (✓/✗, →, smart quotes from LLM responses) crashes with
+# UnicodeEncodeError before the test result even prints. Force UTF-8
+# stdio so the user can actually see the test run.
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # Locate rag-system/ alongside this tests/ folder and put it on the path.
 TESTS_ROOT = Path(__file__).resolve().parent
 RAG_SYSTEM_ROOT = TESTS_ROOT.parent / "rag-system"
@@ -36,7 +47,7 @@ class FakeEmbedder:
     def dim(self) -> int:
         return self._dim
 
-    def embed(self, text: str) -> list[float]:
+    def embed(self, text: str, input_type: str = "document") -> list[float]:
         import hashlib
         import math
 
@@ -54,7 +65,9 @@ class FakeEmbedder:
         norm = math.sqrt(sum(v * v for v in vec)) or 1.0
         return [v / norm for v in vec]
 
-    def embed_batch(self, texts: list[str], batch_size: int = 64) -> list[list[float]]:
+    def embed_batch(
+        self, texts: list[str], batch_size: int = 64, input_type: str = "document"
+    ) -> list[list[float]]:
         return [self.embed(t) for t in texts]
 
     def count_tokens(self, text: str) -> int:

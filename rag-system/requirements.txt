@@ -20,7 +20,16 @@ tokenizers>=0.19.0
 numpy>=1.26.0
 huggingface-hub>=0.23.0
 
+# ── Cloud embeddings (Voyage AI) ──
+# voyage-code-3 is the default embedder (provider=voyage in config.yaml) —
+# tuned for code + documentation. Needs RAG_EMBEDDING__API_KEY in .env.
+voyageai>=0.3.0
+
 # ── Reranking ──
+# sentence-transformers is the primary backend (modern HF cross-encoders
+# like BAAI/bge-reranker-v2-m3). flashrank is kept as a lightweight
+# fallback for the legacy ms-marco family.
+sentence-transformers>=3.0.0
 flashrank>=0.2.0
 
 # ── Structured logging & observability ──
